@@ -15,7 +15,6 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# ВМЕСТО ID ИСПОЛЬЗУЕМ ЮЗЕРНЕЙМЫ (в нижнем регистре!)
 HOLY_TRINITY_USERNAMES = {"youwarm", "ilyshadep", "sadist_perfection"}
 
 MAX_REQUESTS_PER_DAY = 2
@@ -52,7 +51,6 @@ client = TelegramClient(StringSession(), API_ID, API_HASH)
 
 # === ВСПОМОГАТЕЛЬНЫЕ ===
 def is_holy_trinity(user) -> bool:
-    """Проверяет, входит ли пользователь в святую тройку по юзернейму."""
     if not user or not user.username:
         return False
     return user.username.lower() in HOLY_TRINITY_USERNAMES
@@ -189,7 +187,6 @@ async def block_command(event):
     
     target_username = args[1].lstrip("@")
 
-    # === MTProto: Поиск пользователя ===
     try:
         target = await client.get_entity(f"@{target_username}")
         target_id = target.id
@@ -207,7 +204,6 @@ async def block_command(event):
         await event.reply("⏳ Голосование по этому пользователю уже идёт.")
         return
 
-    # Собираем совет по ЮЗЕРНЕЙМАМ
     voters = []
     try:
         participants = await client.get_participants(chat_id)
@@ -221,7 +217,6 @@ async def block_command(event):
     if is_admin_initiator and initiator.id not in voters:
         voters.append(initiator.id)
 
-    # Никого из совета нет онлайн
     if not voters:
         await set_restrictions(chat_id, target_id, False)
         pending_admin_votes[target_id] = {
@@ -237,7 +232,6 @@ async def block_command(event):
         )
         return
 
-    # Запуск голосования
     vote_msg = await event.reply(
         build_vote_text(target_id, {"votes": {}, "allowed_voters": set(voters)}),
         buttons=vote_keyboard(target_id),
@@ -267,12 +261,10 @@ async def vote_callback(event):
         await event.answer("Голосование уже завершено.", alert=True)
         return
 
-    # Проверяем, что голосует либо тот, кто в списке, либо святой
     if user.id not in vote_data["allowed_voters"] and not is_holy_trinity(user):
         await event.answer("Вы не входите в совет голосующих.", alert=True)
         return
         
-    # Если святой зашел, но его не было в списке (например, зашел позже) - добавляем
     if is_holy_trinity(user) and user.id not in vote_data["allowed_voters"]:
         vote_data["allowed_voters"].add(user.id)
 
@@ -307,7 +299,6 @@ async def pending_command(event):
 
     for target_id, data in items:
         if chat_id not in active_votes or target_id not in active_votes[chat_id]:
-            # Собираем всех святых, кто есть в чате
             allowed = set()
             try:
                 participants = await client.get_participants(chat_id)
@@ -329,7 +320,7 @@ async def pending_command(event):
                 "initiator": data["initiator"],
                 "votes": {},
                 "message_id": vote_msg.id,
-                "started_by_admin": True, # Инициатор был святым
+                "started_by_admin": True,
                 "allowed_voters": allowed,
             }
             asyncio.create_task(vote_timeout_task(chat_id, target_id))
@@ -352,5 +343,4 @@ async def main():
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    # ВОТ ЗДЕСЬ БЫЛА ОШИБКА, ТЕПЕРЬ ИСПОЛЬЗУЕТСЯ asyncio.run()
-    asyncio.run(main())
+    asyncio.run(main())   # ← ключевая строка: корутина main запускается через asyncio.run
