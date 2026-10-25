@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import date, datetime, timedelta
 from html import escape as esc
 
@@ -19,8 +20,19 @@ from telegram.ext import (
 
 logger = logging.getLogger(__name__)
 
+# Регулярки вынесены наверх — компилируются один раз
+SUD_RE = re.compile(r"^/?суд\s+@?(\w+)$", re.IGNORECASE)
+PENDING_RE = re.compile(r"^/?ожидание$", re.IGNORECASE)
+VOTE_CB_RE = re.compile(r"^vote\|(ban|noban)\|(\d+)$")
+
 
 def register(app, state: dict) -> None:
+    """Регистрирует хэндлеры модерации в PTB Application.
+
+    state — общий словарь из main.py с ключами:
+      active_votes, pending_admin_votes, daily_requests,
+      holy_trinity, max_requests, vote_timeout, mute_duration, muted_users
+    """
     active_votes = state["active_votes"]
     pending_admin_votes = state["pending_admin_votes"]
     daily_requests = state["daily_requests"]
@@ -30,7 +42,7 @@ def register(app, state: dict) -> None:
     mute_duration = state["mute_duration"]
     muted_users = state["muted_users"]
 
-    # ---------- хелперы ----------
+    # ==================== ХЕЛПЕРЫ ====================
 
     def is_holy_trinity(user) -> bool:
         return bool(user and user.username and user.username.lower() in holy_trinity)
@@ -49,6 +61,7 @@ def register(app, state: dict) -> None:
         return False
 
     async def set_restrictions(bot, chat_id: int, user_id: int, can_send: bool) -> bool:
+        """Снять/поставить мут."""
         try:
             if can_send:
                 perms = ChatPermissions(
@@ -56,6 +69,7 @@ def register(app, state: dict) -> None:
                     can_send_media_messages=True,
                     can_send_other_messages=True,
                     can_add_web_page_previews=True,
+                    can_send_polls=True,
                 )
                 await bot.restrict_chat_member(chat_id, user_id, permissions=perms)
                 muted_users.pop(user_id, None)
@@ -65,6 +79,7 @@ def register(app, state: dict) -> None:
                     can_send_media_messages=False,
                     can_send_other_messages=False,
                     can_add_web_page_previews=False,
+                    can_send_polls=False,
                 )
                 until = datetime.now() + timedelta(seconds=mute_duration)
                 await bot.restrict_chat_member(
@@ -73,7 +88,7 @@ def register(app, state: dict) -> None:
                 muted_users[user_id] = until
             return True
         except TelegramError as e:
-            logger.error("Restrict error: %s", e)
+            logger.error("Restrict error (chat=%s user=%s): %s", chat_id, user_id, e)
             return False
 
     async def ban_user(bot, chat_id: int, user_id: int) -> bool:
@@ -81,7 +96,7 @@ def register(app, state: dict) -> None:
             await bot.ban_chat_member(chat_id, user_id)
             return True
         except TelegramError as e:
-            logger.error("Ban error: %s", e)
+            logger.error("Ban error (chat=%s user=%s): %s", chat_id, user_id, e)
             return False
 
     def vote_keyboard(target_id: int) -> InlineKeyboardMarkup:
@@ -104,11 +119,13 @@ def register(app, state: dict) -> None:
             f"👥 Проголосовали: {voted}/{total}"
         )
         if voted:
-            vlist = ", ".join(f"@{esc(uid)}→{v}" for uid, v in vote_data["votes"].items())
+            vlist = ", ".join(
+                f"@{esc(uid)}→{v}" for uid, v in vote_data["votes"].items()
+            )
             text += f"\n\n📝 Голоса: {vlist}"
         return text
 
-    # ---------- завершение голосования ----------
+    # ==================== ЗАВЕРШЕНИЕ ГОЛОСОВАНИЯ ====================
 
     async def finish_vote(bot, chat_id: int, target_id: int, reason: str = "timeout") -> None:
         vote_data = active_votes[chat_id].pop(target_id, None)
@@ -119,6 +136,7 @@ def register(app, state: dict) -> None:
         ban_votes = sum(1 for v in votes.values() if v == "ban")
         noban_votes = sum(1 for v in votes.values() if v == "noban")
 
+        # Защита: если админ инициировал и проголосовал только он — бан не применяется
         only_initiator = (
             vote_data.get("started_by_admin")
             and len(votes) == 1
@@ -147,6 +165,7 @@ def register(app, state: dict) -> None:
             if target_id in muted_users:
                 await set_restrictions(bot, chat_id, target_id, True)
 
+        # Пытаемся отредактировать сообщение голосования, убрав кнопки
         try:
             await bot.edit_message_text(
                 chat_id=chat_id,
@@ -158,35 +177,37 @@ def register(app, state: dict) -> None:
             pass
 
         pending_admin_votes.pop(target_id, None)
-        await bot.send_message(chat_id, result, parse_mode=ParseMode.HTML)
+        try:
+            await bot.send_message(chat_id, result, parse_mode=ParseMode.HTML)
+        except TelegramError as e:
+            logger.warning("Не удалось отправить результат в чат %s: %s", chat_id, e)
 
     async def vote_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id, target_id = context.job.data
         if chat_id in active_votes and target_id in active_votes[chat_id]:
             await finish_vote(context.bot, chat_id, target_id, reason="timeout")
 
-    # ---------- хэндлеры ----------
+    # ==================== ХЭНДЛЕРЫ ====================
 
     async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
         chat_id = update.effective_chat.id
         initiator = update.effective_user
 
-        parts = (msg.text or "").split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip():
+        m = SUD_RE.match(msg.text or "")
+        if not m:
             await msg.reply_text(
                 "❌ Использование: <code>/суд @username</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
 
-        target_username = parts[1].strip().lstrip("@").lower()
-        if not target_username:
-            await msg.reply_text("❌ Укажите юзернейм.")
-            return
+        target_username = m.group(1).lower()
 
         if not check_daily_limit(initiator):
-            await msg.reply_text("⛔ Вы исчерпали лимит запросов на суд (2 в день).")
+            await msg.reply_text(
+                f"⛔ Вы исчерпали лимит запросов на суд ({max_requests} в день)."
+            )
             return
 
         try:
@@ -227,6 +248,7 @@ def register(app, state: dict) -> None:
             "started_by_admin": is_admin_initiator,
             "allowed_voters": allowed_voters,
         }
+
         context.job_queue.run_once(
             vote_timeout_job,
             when=vote_timeout,
@@ -239,12 +261,13 @@ def register(app, state: dict) -> None:
         user = query.from_user
         chat_id = update.effective_chat.id
 
-        try:
-            _, action, target_str = query.data.split("|")
-            target_id = int(target_str)
-        except ValueError:
+        m = VOTE_CB_RE.match(query.data or "")
+        if not m:
             await query.answer("Некорректные данные голосования.", show_alert=True)
             return
+
+        action = m.group(1)
+        target_id = int(m.group(2))
 
         vote_data = active_votes.get(chat_id, {}).get(target_id)
         if not vote_data:
@@ -263,6 +286,7 @@ def register(app, state: dict) -> None:
             await query.answer("Вы не входите в совет голосующих.", show_alert=True)
             return
 
+        # Разрешаем переголосовать (перезапись)
         vote_data["votes"][username] = action
         await query.answer("Голос учтён.")
 
@@ -275,6 +299,7 @@ def register(app, state: dict) -> None:
         except TelegramError:
             pass
 
+        # Все проголосовали — завершаем досрочно
         if len(vote_data["votes"]) >= len(vote_data["allowed_voters"]):
             await finish_vote(context.bot, chat_id, target_id, reason="all_voted")
 
@@ -285,7 +310,10 @@ def register(app, state: dict) -> None:
 
         msg = update.effective_message
         chat_id = update.effective_chat.id
-        items = [(tid, d) for tid, d in pending_admin_votes.items() if d["chat_id"] == chat_id]
+        items = [
+            (tid, d) for tid, d in pending_admin_votes.items()
+            if d["chat_id"] == chat_id
+        ]
 
         if not items:
             await msg.reply_text("Нет отложенных голосований.")
@@ -327,12 +355,12 @@ def register(app, state: dict) -> None:
         for tid, _ in items:
             pending_admin_votes.pop(tid, None)
 
-    app.add_handler(
-        MessageHandler(filters.Regex(r"^/?суд\s+@?\w+$", flags=re.IGNORECASE if (re := __import__("re")) else 0), block_command)
-    )
-    app.add_handler(CallbackQueryHandler(vote_callback, pattern=r"^vote\|"))
-    app.add_handler(
-        MessageHandler(filters.Regex(r"^/?ожидание$", flags=(__import__("re").IGNORECASE)), pending_command)
-    )
+    # ==================== РЕГИСТРАЦИЯ ====================
 
-    logger.info("Moderation module: 'суд', 'ожидание', vote-callback зарегистрированы.")
+    app.add_handler(MessageHandler(filters.Regex(SUD_RE), block_command))
+    app.add_handler(CallbackQueryHandler(vote_callback, pattern=r"^vote\|"))
+    app.add_handler(MessageHandler(filters.Regex(PENDING_RE), pending_command))
+
+    logger.info(
+        "Moderation module: 'суд', 'ожидание', vote-callback зарегистрированы."
+    )
