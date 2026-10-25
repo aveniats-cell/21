@@ -12,6 +12,7 @@ from telethon.sessions import StringSession
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+STRING_SESSION = os.environ.get("STRING_SESSION", "")
 
 HOLY_TRINITY_USERNAMES = {"youwarm", "ilyshadep", "naranjortiz"}
 
@@ -24,12 +25,16 @@ logging.basicConfig(
     level=logging.INFO
 )
 
+# === ВРЕМЕННАЯ ПАМЯТЬ RENDER ===
 daily_requests = defaultdict(lambda: {"date": datetime.date.today(), "count": 0})
 active_votes = defaultdict(dict)
-muted_users = {}
 pending_admin_votes = {}
 
-client = TelegramClient(StringSession(), API_ID, API_HASH)
+# === КЛИЕНТ ===
+if STRING_SESSION:
+    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+else:
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -49,25 +54,35 @@ def run_health_server():
 
 
 async def main():
-    if not API_ID or not API_HASH or not BOT_TOKEN:
-        logging.error("❌ ОШИБКА: Не заданы переменные окружения (API_ID, API_HASH или BOT_TOKEN)!")
+    if not API_ID or not API_HASH:
+        logging.error("❌ ОШИБКА: Не заданы API_ID или API_HASH!")
         return
 
     threading.Thread(target=run_health_server, daemon=True).start()
     logging.info("Фоновый веб-сервер для Render успешно запущен.")
 
-    await client.start(bot_token=BOT_TOKEN)
-    logging.info("Бот запущен через MTProto (Telethon)! Готов к работе.")
+    if STRING_SESSION:
+        await client.start()
+        logging.info("Бот запущен по готовой сессии (STRING_SESSION).")
+    else:
+        if not BOT_TOKEN:
+            logging.error("❌ ОШИБКА: Нет ни STRING_SESSION, ни BOT_TOKEN!")
+            return
+        logging.warning("⚠️ STRING_SESSION не задан. Вход по bot_token (риск FloodWait).")
+        await client.start(bot_token=BOT_TOKEN)
+
+    me = await client.get_me()
+    logging.info(f"Бот: @{me.username} (bot={me.bot}). Готов к работе.")
 
     import moderation
     import cubic
     import ship
     import curse
+    import profile
 
     moderation.register(
         client=client,
         active_votes=active_votes,
-        muted_users=muted_users,
         pending_admin_votes=pending_admin_votes,
         daily_requests=daily_requests,
         holy_trinity=HOLY_TRINITY_USERNAMES,
@@ -79,8 +94,9 @@ async def main():
     cubic.register(client=client)
     ship.register(client=client)
     curse.register(client=client)
+    profile.register(client=client, holy_trinity=HOLY_TRINITY_USERNAMES)
 
-    logging.info("✅ Модули moderation, cubic, ship, curse подключены.")
+    logging.info("✅ Модули moderation, cubic, ship, curse, profile подключены.")
 
     await client.run_until_disconnected()
 
