@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 SHIP_RE = re.compile(r"^/?шип\s+@?(\w+)\s+@?(\w+)$", re.IGNORECASE)
 
 
-def register(app) -> None:
+def register(app, resolver) -> None:
     async def ship_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
         m = SHIP_RE.match(msg.text or "")
@@ -20,10 +20,19 @@ def register(app) -> None:
             return
         u1_name, u2_name = m.group(1), m.group(2)
 
-        try:
-            u1 = await context.bot.get_chat(f"@{u1_name}")
-            u2 = await context.bot.get_chat(f"@{u2_name}")
-        except Exception:
+        async def resolve(name):
+            if resolver and resolver.enabled:
+                ent = await resolver.resolve(name)
+                if ent is not None:
+                    return ent
+            try:
+                return await context.bot.get_chat(f"@{name}")
+            except Exception:
+                return None
+
+        u1 = await resolve(u1_name)
+        u2 = await resolve(u2_name)
+        if not u1 or not u2:
             await msg.reply_text("❌ Пользователи не найдены.")
             return
 
@@ -43,11 +52,16 @@ def register(app) -> None:
         else:
             comment = "💀 Бегите друг от друга."
 
-        name1 = getattr(u1, "first_name", None) or getattr(u1, "title", None) or str(u1.id)
-        name2 = getattr(u2, "first_name", None) or getattr(u2, "title", None) or str(u2.id)
+        def name_of(u):
+            return (
+                getattr(u, "first_name", None)
+                or getattr(u, "title", None)
+                or getattr(u, "username", None)
+                or str(u.id)
+            )
 
         await msg.reply_text(
-            f"💘 <b>{esc(name1)}</b> + <b>{esc(name2)}</b>\n"
+            f"💘 <b>{esc(name_of(u1))}</b> + <b>{esc(name_of(u2))}</b>\n"
             f"Совместимость: <b>{pct}%</b>\n"
             f"{comment}",
             parse_mode=ParseMode.HTML,
