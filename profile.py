@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 PROFILE_RE = re.compile(r"^/?профиль(?:\s+@?(\w+))?$", re.IGNORECASE)
 
 
-def register(app, holy_trinity: set[str]) -> None:
+def register(app, holy_trinity: set[str], resolver) -> None:
     async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
         user = update.effective_user
@@ -37,11 +37,17 @@ def register(app, holy_trinity: set[str]) -> None:
             return
         target_name = m.group(1)
 
-        # Выбор цели: аргумент → реплай → сам отправитель
+        # Резолвим: аргумент → реплай → сам отправитель
         if target_name:
-            try:
-                target = await context.bot.get_chat(f"@{target_name}")
-            except Exception:
+            target = None
+            if resolver and resolver.enabled:
+                target = await resolver.resolve(target_name)
+            if target is None:
+                try:
+                    target = await context.bot.get_chat(f"@{target_name}")
+                except Exception:
+                    target = None
+            if target is None:
                 await msg.reply_text("❌ Пользователь не найден.")
                 return
         elif msg.reply_to_message and msg.reply_to_message.from_user:
@@ -60,16 +66,27 @@ def register(app, holy_trinity: set[str]) -> None:
             await msg.reply_text(f"❌ Ошибка базы: {esc(str(e))}", parse_mode=ParseMode.HTML)
             return
 
-        # Должность
+        # Должность: PTB → резолвер как fallback
         role = "Участник"
+        got_role = False
         try:
             member = await context.bot.get_chat_member(chat.id, target.id)
             if isinstance(member, ChatMemberOwner):
                 role = "Создатель"
+                got_role = True
             elif isinstance(member, ChatMemberAdministrator):
                 role = "Админ"
+                got_role = True
         except Exception:
             pass
+
+        if not got_role and resolver and resolver.enabled:
+            perms = await resolver.get_permissions(chat.id, target.id)
+            if perms:
+                if getattr(perms, "is_creator", False):
+                    role = "Создатель"
+                elif getattr(perms, "is_admin", False):
+                    role = "Админ"
 
         username = getattr(target, "username", None)
         is_sss = "Да" if username and username.lower() in holy_trinity else "Нет"
@@ -94,7 +111,6 @@ def register(app, holy_trinity: set[str]) -> None:
             parse_mode=ParseMode.HTML,
         )
 
-    # Трекер активности — в группе 1, чтобы не мешать другим хэндлерам
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, track_activity),
         group=1,
