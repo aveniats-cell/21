@@ -9,34 +9,29 @@ from collections import defaultdict
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-# === НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ===
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# === СОВЕТ ГОЛОСУЮЩИХ (РОВНО 3 ЧЕЛОВЕКА) ===
 HOLY_TRINITY_USERNAMES = {"youwarm", "ilyshadep", "naranjortiz"}
 
 MAX_REQUESTS_PER_DAY = 2
-VOTE_TIMEOUT = 300            # 5 минут
-MUTE_DURATION = 60 * 60 * 24  # 24 часа
+VOTE_TIMEOUT = 300
+MUTE_DURATION = 60 * 60 * 24
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
-# === ХРАНИЛИЩА (общие для всех модулей) ===
 daily_requests = defaultdict(lambda: {"date": datetime.date.today(), "count": 0})
 active_votes = defaultdict(dict)
 muted_users = {}
 pending_admin_votes = {}
 
-# === КЛИЕНТ ===
 client = TelegramClient(StringSession(), API_ID, API_HASH)
 
 
-# === ФИКТИВНЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ===
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -53,7 +48,6 @@ def run_health_server():
     server.serve_forever()
 
 
-# === ЗАПУСК ===
 async def main():
     if not API_ID or not API_HASH or not BOT_TOKEN:
         logging.error("❌ ОШИБКА: Не заданы переменные окружения (API_ID, API_HASH или BOT_TOKEN)!")
@@ -65,7 +59,6 @@ async def main():
     await client.start(bot_token=BOT_TOKEN)
     logging.info("Бот запущен через MTProto (Telethon)! Готов к работе.")
 
-    # === РЕГИСТРАЦИЯ МОДУЛЕЙ ===
     import moderation
     import cubic
     import ship
