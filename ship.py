@@ -4,29 +4,22 @@ import logging
 from telethon import events
 
 
-# === РЕГИСТРАЦИЯ ВСЕХ ХЭНДЛЕРОВ МОДУЛЯ ===
 def register(client):
-    """Вызывается из main.py после старта клиента."""
-
-    @client.on(events.NewMessage(pattern=r'^/ship'))
+    @client.on(events.NewMessage(pattern=r'(?i)^/?шип\s+@?(\w+)\s+@?(\w+)$'))
     async def ship_cmd(event):
-        args = event.message.text.split()
-        if len(args) < 3:
-            await event.reply("❌ Использование: `/ship @user1 @user2`", parse_mode='md')
-            return
+        u1_name = event.pattern_match.group(1)
+        u2_name = event.pattern_match.group(2)
 
         try:
-            u1 = await client.get_entity(args[1].lstrip('@'))
-            u2 = await client.get_entity(args[2].lstrip('@'))
+            u1 = await client.get_entity(u1_name)
+            u2 = await client.get_entity(u2_name)
         except Exception:
             await event.reply("❌ Пользователи не найдены.")
             return
 
-        # Стабильный результат: хеш от отсортированных ID
         seed = "-".join(sorted([str(u1.id), str(u2.id)]))
         pct = int(hashlib.md5(seed.encode()).hexdigest(), 16) % 101
 
-        # Забавные комментарии по диапазонам
         if pct >= 90:
             comment = "💍 Да это судьба! Свадьбу когда?"
         elif pct >= 70:
@@ -47,4 +40,4 @@ def register(client):
             parse_mode='md'
         )
 
-    logging.info("Ship module: зарегистрирован /ship.")
+    logging.info("Ship module: зарегистрирован 'шип @user1 @user2'.")
