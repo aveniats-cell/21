@@ -14,7 +14,7 @@ def register(client):
     async def meme_cmd(event):
         # Опционально: /meme <subreddit> — мем из конкретного сабреддита
         args = event.message.text.split()
-        subreddit = args[1].lstrip('r/') if len(args) > 1 else "memes"
+        subreddit = args[1].lstrip('r/') if len(args) > 1 else "ruAsska"
 
         try:
             url = f"https://meme-api.com/gimme/{subreddit}"
@@ -23,11 +23,6 @@ def register(client):
                 data = json.loads(r.read().decode())
         except Exception as e:
             await event.reply(f"❌ Не удалось загрузить мем: {e}")
-            return
-
-        # Фильтр NSFW — обязательно, контент с Reddit непредсказуем
-        if data.get("nsfw"):
-            await event.reply("🔞 Мем оказался NSFW. Попробуй ещё раз.")
             return
 
         title = data.get("title", "Без названия")[:100]
@@ -55,4 +50,4 @@ def register(client):
             except Exception as e:
                 await event.reply(f"❌ Не удалось отправить мем: {e}")
 
-    logging.info("Meme module: зарегистрирован /meme.")
+    logging.info("Meme module: зарегистрирован /meme (русские мемы по умолчанию).")
