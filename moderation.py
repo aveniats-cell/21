@@ -18,21 +18,16 @@ from telegram.ext import (
     filters,
 )
 
+from resolver import is_bot
+
 logger = logging.getLogger(__name__)
 
-# Регулярки вынесены наверх — компилируются один раз
 SUD_RE = re.compile(r"^/?суд\s+@?(\w+)$", re.IGNORECASE)
 PENDING_RE = re.compile(r"^/?ожидание$", re.IGNORECASE)
 VOTE_CB_RE = re.compile(r"^vote\|(ban|noban)\|(\d+)$")
 
 
 def register(app, state: dict) -> None:
-    """Регистрирует хэндлеры модерации в PTB Application.
-
-    state — общий словарь из main.py с ключами:
-      active_votes, pending_admin_votes, daily_requests,
-      holy_trinity, max_requests, vote_timeout, mute_duration, muted_users
-    """
     active_votes = state["active_votes"]
     pending_admin_votes = state["pending_admin_votes"]
     daily_requests = state["daily_requests"]
@@ -41,6 +36,7 @@ def register(app, state: dict) -> None:
     vote_timeout = state["vote_timeout"]
     mute_duration = state["mute_duration"]
     muted_users = state["muted_users"]
+    resolver = state.get("resolver")
 
     # ==================== ХЕЛПЕРЫ ====================
 
@@ -60,8 +56,19 @@ def register(app, state: dict) -> None:
             return True
         return False
 
+    async def resolve_target(username: str):
+        """Ищет пользователя сначала через MTProto, потом через PTB."""
+        if resolver and resolver.enabled:
+            entity = await resolver.resolve(username)
+            if entity is not None:
+                return entity
+        # fallback на Bot API
+        try:
+            return await app.bot.get_chat(f"@{username}")
+        except Exception:
+            return None
+
     async def set_restrictions(bot, chat_id: int, user_id: int, can_send: bool) -> bool:
-        """Снять/поставить мут."""
         try:
             if can_send:
                 perms = ChatPermissions(
@@ -136,7 +143,6 @@ def register(app, state: dict) -> None:
         ban_votes = sum(1 for v in votes.values() if v == "ban")
         noban_votes = sum(1 for v in votes.values() if v == "noban")
 
-        # Защита: если админ инициировал и проголосовал только он — бан не применяется
         only_initiator = (
             vote_data.get("started_by_admin")
             and len(votes) == 1
@@ -165,7 +171,6 @@ def register(app, state: dict) -> None:
             if target_id in muted_users:
                 await set_restrictions(bot, chat_id, target_id, True)
 
-        # Пытаемся отредактировать сообщение голосования, убрав кнопки
         try:
             await bot.edit_message_text(
                 chat_id=chat_id,
@@ -210,20 +215,22 @@ def register(app, state: dict) -> None:
             )
             return
 
-        try:
-            target = await context.bot.get_chat(f"@{target_username}")
-            if getattr(target, "is_bot", False):
-                await msg.reply_text("❌ Нельзя блокировать ботов.")
-                return
-            target_id = target.id
-            if target_id == initiator.id:
-                await msg.reply_text("❌ Нельзя блокировать себя.")
-                return
-        except Exception:
+        # ← вот здесь резолвим через MTProto
+        target = await resolve_target(target_username)
+        if target is None:
             await msg.reply_text(
                 f"❌ Не удалось найти <code>@{esc(target_username)}</code>.",
                 parse_mode=ParseMode.HTML,
             )
+            return
+
+        if is_bot(target):
+            await msg.reply_text("❌ Нельзя блокировать ботов.")
+            return
+
+        target_id = target.id
+        if target_id == initiator.id:
+            await msg.reply_text("❌ Нельзя блокировать себя.")
             return
 
         if chat_id in active_votes and target_id in active_votes[chat_id]:
@@ -286,7 +293,6 @@ def register(app, state: dict) -> None:
             await query.answer("Вы не входите в совет голосующих.", show_alert=True)
             return
 
-        # Разрешаем переголосовать (перезапись)
         vote_data["votes"][username] = action
         await query.answer("Голос учтён.")
 
@@ -299,7 +305,6 @@ def register(app, state: dict) -> None:
         except TelegramError:
             pass
 
-        # Все проголосовали — завершаем досрочно
         if len(vote_data["votes"]) >= len(vote_data["allowed_voters"]):
             await finish_vote(context.bot, chat_id, target_id, reason="all_voted")
 
@@ -325,12 +330,21 @@ def register(app, state: dict) -> None:
 
             allowed = set(holy_trinity)
             initiator_username = None
-            try:
-                initiator_entity = await context.bot.get_chat(data["initiator"])
-                if getattr(initiator_entity, "username", None):
-                    initiator_username = initiator_entity.username.lower()
-            except Exception:
-                pass
+
+            # Резолвим инициатора через MTProto, чтобы вытащить username
+            initiator_entity = None
+            if resolver and resolver.enabled:
+                initiator_entity = await resolver.resolve_by_id(data["initiator"])
+            if initiator_entity is None:
+                try:
+                    initiator_entity = await context.bot.get_chat(data["initiator"])
+                except Exception:
+                    pass
+
+            if initiator_entity is not None:
+                uname = getattr(initiator_entity, "username", None)
+                if uname:
+                    initiator_username = uname.lower()
 
             vote_msg = await msg.reply_text(
                 build_vote_text(target_id, {"votes": {}, "allowed_voters": allowed}),
