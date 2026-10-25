@@ -7,7 +7,7 @@ def register(client):
     async def wea_cmd(event):
         city = event.pattern_match.group(1).strip()
 
-        # Шаг 1: геокодинг
+        # Шаг 1: геокодинг (город -> координаты)
         geo_url = "https://geocoding-api.open-meteo.com/v1/search"
         params = {"name": city, "count": 1, "language": "ru", "format": "json"}
         try:
@@ -20,7 +20,7 @@ def register(client):
 
         results = geo_data.get("results")
         if not results:
-            await event.reply("❌ Город не найден.")
+            await event.reply("❌ Город не найден. Попробуй написать название по-другому (например, Tambow или Тамбов).")
             return
 
         loc = results[0]
@@ -28,13 +28,12 @@ def register(client):
         display_name = loc.get("name", city)
         country = loc.get("country", "")
 
-        # Шаг 2: погода (current_weather — стабильный параметр)
+        # Шаг 2: погода — используем НОВЫЙ параметр current с правильными именами полей
         weather_url = "https://api.open-meteo.com/v1/forecast"
         w_params = {
             "latitude": lat,
             "longitude": lon,
-            "current_weather": "true",
-            "hourly": "relativehumidity_2m",
+            "current": "temperature_2m,wind_speed_10m,weather_code,relative_humidity_2m",
             "timezone": "auto",
         }
         try:
@@ -45,25 +44,17 @@ def register(client):
             await event.reply(f"❌ Ошибка погоды: {e}")
             return
 
-        cur = w_data.get("current_weather", {})
-        temp = cur.get("temperature")
-        wind = cur.get("windspeed")
-        code = cur.get("weathercode", 0)
+        # Парсим объект current (новый формат)
+        cur = w_data.get("current", {})
+        temp = cur.get("temperature_2m")
+        wind = cur.get("wind_speed_10m")
+        hum = cur.get("relative_humidity_2m")
+        code = cur.get("weather_code", 0)
 
-        # Влажность: берём из hourly за текущий час
-        hum = None
-        try:
-            hourly = w_data.get("hourly", {})
-            times = hourly.get("time", [])
-            hums = hourly.get("relativehumidity_2m", [])
-            cur_time = cur.get("time", "")
-            if cur_time and times:
-                # Ищем индекс текущего часа
-                idx = times.index(cur_time) if cur_time in times else 0
-                if idx < len(hums):
-                    hum = hums[idx]
-        except Exception:
-            pass
+        # Если вдруг current пустой — сообщаем
+        if temp is None and wind is None:
+            await event.reply("❌ Не удалось получить данные о погоде. Попробуй позже.")
+            return
 
         # Расшифровка WMO-кодов
         weather_desc = {
@@ -76,9 +67,9 @@ def register(client):
             95: "⛈️ Гроза", 96: "⛈️ Гроза с градом", 99: "⛈️ Сильная гроза с градом",
         }.get(code, "🌡️ Неизвестно")
 
+        temp_str = f"{temp}°C" if temp is not None else "н/д"
         hum_str = f"{hum}%" if hum is not None else "н/д"
         wind_str = f"{wind} км/ч" if wind is not None else "н/д"
-        temp_str = f"{temp}°C" if temp is not None else "н/д"
 
         await event.reply(
             f"🌍 **{display_name}** {country}\n"
