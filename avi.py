@@ -1,6 +1,9 @@
 import asyncio
 import datetime
 import logging
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
 from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -8,7 +11,8 @@ from telegram.ext import (
 )
 
 # === НАСТРОЙКИ ===
-BOT_TOKEN = "8806416760:AAE-NUsbDmaF_WfMvRZdoF_y9ideWzpx37E"  # ← замените на реальный токен
+# ВНИМАНИЕ: Токен в коде виден всем, у кого есть доступ к файлу.
+BOT_TOKEN = "8806416760:AAE-NUsbDmaF_WfMvRZdoF_y9ideWzpx37E"  # ← Замените на новый, если отзовете старый
 HOLY_TRINITY = {1319217425, 5376112672, 855714453}  # «святая тройка»
 MAX_REQUESTS_PER_DAY = 2
 VOTE_TIMEOUT = 300            # 5 минут
@@ -16,13 +20,26 @@ MUTE_DURATION = 60 * 60 * 24  # 24 часа мут (если голосован�
 
 logging.basicConfig(level=logging.INFO)
 
+# === ФИКТИВНЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ===
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+
 # === ХРАНИЛИЩА ===
 daily_requests = defaultdict(lambda: {"date": datetime.date.today(), "count": 0})
-# chat_id -> {target_id: {"initiator", "votes": {uid: "ban"/"noban"}, "message_id",
-#                         "task", "started_by_admin", "allowed_voters": set}}
 active_votes = defaultdict(dict)
-muted_users = {}          # user_id -> datetime окончания мута
-pending_admin_votes = {}  # target_id -> {chat_id, initiator, target_id}
+muted_users = {}          
+pending_admin_votes = {}  
 
 
 # === ВСПОМОГАТЕЛЬНЫЕ ===
@@ -108,7 +125,6 @@ async def finish_vote(context, chat_id: int, target_id: int, reason: str = "time
     ban_votes = sum(1 for v in votes.values() if v == "ban")
     noban_votes = sum(1 for v in votes.values() if v == "noban")
 
-    # Админ-инициатор не может забанить в одиночку
     only_initiator = (
         vote_data.get("started_by_admin")
         and len(votes) == 1
@@ -189,7 +205,6 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⏳ Голосование по этому пользователю уже идёт.")
         return
 
-    # Совет голосующих
     voters = []
     for admin_id in HOLY_TRINITY:
         try:
@@ -203,7 +218,6 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin_initiator and initiator.id not in voters:
         voters.append(initiator.id)
 
-    # Никого из совета нет онлайн
     if not voters:
         await mute_user(context, chat.id, target_id)
         pending_admin_votes[target_id] = {
@@ -223,7 +237,6 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Запуск голосования
     vote_msg = await msg.reply_text(
         build_vote_text(target_id, {"votes": {}, "allowed_voters": set(voters)}),
         reply_markup=vote_keyboard(target_id),
@@ -330,12 +343,17 @@ async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    # Запускаем фоновый веб-сервер для Render
+    threading.Thread(target=run_health_server, daemon=True).start()
+    logging.info("Фоновый веб-сервер для Render успешно запущен.")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("block", block_command))
     app.add_handler(CommandHandler("pending", pending_command))
     app.add_handler(CallbackQueryHandler(vote_callback, pattern=r"^vote\|"))
 
+    logging.info("Бот запущен и готов к работе!")
     app.run_polling()
 
 
