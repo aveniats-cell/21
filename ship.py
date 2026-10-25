@@ -25,7 +25,6 @@ def register(client):
         # Стабильный результат: хеш от отсортированных ID
         seed = "-".join(sorted([str(u1.id), str(u2.id)]))
         pct = int(hashlib.md5(seed.encode()).hexdigest(), 16) % 101
-        bar = "❤️" * (pct // 10) + "🖤" * (10 - pct // 10)
 
         # Забавные комментарии по диапазонам
         if pct >= 90:
@@ -43,7 +42,6 @@ def register(client):
 
         await event.reply(
             f"💘 **{u1.first_name}** + **{u2.first_name}**\n"
-            f"{bar}\n"
             f"Совместимость: **{pct}%**\n"
             f"{comment}",
             parse_mode='md'
