@@ -1,1 +1,3 @@
 telethon
+imgapi
+scrapling
