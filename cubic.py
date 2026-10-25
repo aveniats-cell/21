@@ -6,20 +6,10 @@ import logging
 from telethon import events
 
 
-# === РЕГИСТРАЦИЯ ВСЕХ ХЭНДЛЕРОВ МОДУЛЯ ===
 def register(client):
-    """Вызывается из main.py после старта клиента."""
-
-    @client.on(events.NewMessage(pattern=r'^/cubic'))
+    @client.on(events.NewMessage(pattern=r'(?i)^/?удача\s+(.+)$'))
     async def cubic_cmd(event):
-        text = event.message.text[len('/cubic'):].strip()
-        if not text:
-            await event.reply(
-                "❌ Использование: `/cubic Орел, решка, Иван гай`\n"
-                "Разделяй варианты запятой.",
-                parse_mode='md'
-            )
-            return
+        text = event.pattern_match.group(1).strip()
 
         raw = re.split(r'[,;]|\s+или\s+', text)
         options = [o.strip() for o in raw if o.strip()]
@@ -59,18 +49,17 @@ def register(client):
         except Exception:
             await event.reply(f"🎰 Выпало: **{winner}**", parse_mode='md')
 
-    @client.on(events.NewMessage(pattern=r'^/coin'))
+    @client.on(events.NewMessage(pattern=r'(?i)^/?монетка$'))
     async def coin_cmd(event):
         result = random.choice(["🪙 **Орёл!**", "🪙 **Решка!**"])
         await event.reply(result, parse_mode='md')
 
-    @client.on(events.NewMessage(pattern=r'^/roll'))
+    @client.on(events.NewMessage(pattern=r'(?i)^/?кубик(?:\s+(\S+))?$'))
     async def roll_cmd(event):
-        args = event.message.text.split()
-        dice = args[1] if len(args) > 1 else "1d6"
+        dice = event.pattern_match.group(1) or "1d6"
         m = re.fullmatch(r'(\d*)d(\d+)', dice.lower())
         if not m:
-            await event.reply("❌ Формат: `/roll 2d6` или `/roll d20`", parse_mode='md')
+            await event.reply("❌ Формат: `кубик 2d6` или `кубик d20`", parse_mode='md')
             return
         count = int(m.group(1)) if m.group(1) else 1
         sides = int(m.group(2))
@@ -82,24 +71,21 @@ def register(client):
         detail = " + ".join(map(str, rolls)) if count > 1 else str(rolls[0])
         await event.reply(f"🎲 **{dice}** → {detail}" + (f" = **{total}**" if count > 1 else ""), parse_mode='md')
 
-    @client.on(events.NewMessage(pattern=r'^/random'))
+    @client.on(events.NewMessage(pattern=r'(?i)^/?рандом(?:\s+(\d+)\s+(\d+))?$'))
     async def random_cmd(event):
-        args = event.message.text.split()
-        try:
-            a, b = int(args[1]), int(args[2])
-            if a > b:
-                a, b = b, a
-        except (IndexError, ValueError):
-            await event.reply("❌ Использование: `/random 1 100`", parse_mode='md')
+        a_str = event.pattern_match.group(1)
+        b_str = event.pattern_match.group(2)
+        if not a_str or not b_str:
+            await event.reply("❌ Использование: `рандом 1 100`", parse_mode='md')
             return
+        a, b = int(a_str), int(b_str)
+        if a > b:
+            a, b = b, a
         await event.reply(f"🎯 Случайное число: **{random.randint(a, b)}**", parse_mode='md')
 
-    @client.on(events.NewMessage(pattern=r'^/8ball'))
+    @client.on(events.NewMessage(pattern=r'(?i)^/?шар\s+(.+)$'))
     async def ball_cmd(event):
-        text = event.message.text[len('/8ball'):].strip()
-        if not text:
-            await event.reply("❌ Задайте вопрос: `/8ball Будет ли сегодня дождь?`", parse_mode='md')
-            return
+        text = event.pattern_match.group(1).strip()
         answers = [
             "✅ Да, определённо.", "✅ Безусловно.", "✅ Скорее да.",
             "🤔 Возможно.", "🤔 Не уверен.", "🤔 Спроси позже.",
@@ -107,7 +93,7 @@ def register(client):
         ]
         await event.reply(f"🎱 {random.choice(answers)}", parse_mode='md')
 
-    @client.on(events.NewMessage(pattern=r'^/ping'))
+    @client.on(events.NewMessage(pattern=r'(?i)^/?пинг$'))
     async def ping_cmd(event):
         import time
         start = time.time()
@@ -115,4 +101,4 @@ def register(client):
         ms = (time.time() - start) * 1000
         await msg.edit(f"🏓 **Pong!** `{ms:.0f}ms`", parse_mode='md')
 
-    logging.info("Cubic module: зарегистрированы /cubic, /coin, /roll, /random, /8ball, /ping.")
+    logging.info("Cubic module: зарегистрированы 'удача', 'монетка', 'кубик', 'рандом', 'шар', 'пинг'.")
