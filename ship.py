@@ -1,20 +1,30 @@
 import hashlib
 import logging
+import re
+from html import escape as esc
 
-from telethon import events
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import ContextTypes, MessageHandler, filters
+
+logger = logging.getLogger(__name__)
+
+SHIP_RE = re.compile(r"^/?шип\s+@?(\w+)\s+@?(\w+)$", re.IGNORECASE)
 
 
-def register(client):
-    @client.on(events.NewMessage(pattern=r'(?i)^/?шип\s+@?(\w+)\s+@?(\w+)$'))
-    async def ship_cmd(event):
-        u1_name = event.pattern_match.group(1)
-        u2_name = event.pattern_match.group(2)
+def register(app) -> None:
+    async def ship_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        m = SHIP_RE.match(msg.text or "")
+        if not m:
+            return
+        u1_name, u2_name = m.group(1), m.group(2)
 
         try:
-            u1 = await client.get_entity(u1_name)
-            u2 = await client.get_entity(u2_name)
+            u1 = await context.bot.get_chat(f"@{u1_name}")
+            u2 = await context.bot.get_chat(f"@{u2_name}")
         except Exception:
-            await event.reply("❌ Пользователи не найдены.")
+            await msg.reply_text("❌ Пользователи не найдены.")
             return
 
         seed = "-".join(sorted([str(u1.id), str(u2.id)]))
@@ -33,11 +43,16 @@ def register(client):
         else:
             comment = "💀 Бегите друг от друга."
 
-        await event.reply(
-            f"💘 **{u1.first_name}** + **{u2.first_name}**\n"
-            f"Совместимость: **{pct}%**\n"
+        name1 = getattr(u1, "first_name", None) or getattr(u1, "title", None) or str(u1.id)
+        name2 = getattr(u2, "first_name", None) or getattr(u2, "title", None) or str(u2.id)
+
+        await msg.reply_text(
+            f"💘 <b>{esc(name1)}</b> + <b>{esc(name2)}</b>\n"
+            f"Совместимость: <b>{pct}%</b>\n"
             f"{comment}",
-            parse_mode='md'
+            parse_mode=ParseMode.HTML,
         )
 
-    logging.info("Ship module: зарегистрирован 'шип @user1 @user2'.")
+    app.add_handler(MessageHandler(filters.Regex(SHIP_RE), ship_cmd))
+
+    logger.info("Ship module: 'шип @user1 @user2' зарегистрирован.")
