@@ -1,30 +1,42 @@
-import asyncio
-import datetime
 import logging
+from datetime import date, datetime, timedelta
+from html import escape as esc
 
-from telethon import events, Button
-from telethon.tl.functions.channels import EditBannedRequest
-from telethon.tl.types import ChatBannedRights
+from telegram import (
+    ChatPermissions,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
+from telegram.ext import (
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+logger = logging.getLogger(__name__)
 
 
-def register(
-    client,
-    active_votes,
-    muted_users,
-    pending_admin_votes,
-    daily_requests,
-    holy_trinity,
-    max_requests,
-    vote_timeout,
-    mute_duration,
-):
+def register(app, state: dict) -> None:
+    active_votes = state["active_votes"]
+    pending_admin_votes = state["pending_admin_votes"]
+    daily_requests = state["daily_requests"]
+    holy_trinity = state["holy_trinity"]
+    max_requests = state["max_requests"]
+    vote_timeout = state["vote_timeout"]
+    mute_duration = state["mute_duration"]
+    muted_users = state["muted_users"]
+
+    # ---------- хелперы ----------
+
     def is_holy_trinity(user) -> bool:
-        if not user or not user.username:
-            return False
-        return user.username.lower() in holy_trinity
+        return bool(user and user.username and user.username.lower() in holy_trinity)
 
     def check_daily_limit(user) -> bool:
-        today = datetime.date.today()
+        today = date.today()
         rec = daily_requests[user.id]
         if rec["date"] != today:
             rec["date"] = today
@@ -36,42 +48,47 @@ def register(
             return True
         return False
 
-    async def set_restrictions(chat_id, user_id, can_send: bool):
+    async def set_restrictions(bot, chat_id: int, user_id: int, can_send: bool) -> bool:
         try:
-            rights = ChatBannedRights(
-                until_date=None if can_send else datetime.datetime.now() + datetime.timedelta(seconds=mute_duration),
-                send_messages=not can_send,
-                send_media=not can_send,
-                send_stickers=not can_send,
-                send_gifs=not can_send,
-                send_games=not can_send,
-                send_inline=not can_send,
-                embed_links=not can_send,
-            )
-            await client(EditBannedRequest(chat_id, user_id, rights))
-            if not can_send:
-                muted_users[user_id] = datetime.datetime.now() + datetime.timedelta(seconds=mute_duration)
-            else:
+            if can_send:
+                perms = ChatPermissions(
+                    can_send_messages=True,
+                    can_send_media_messages=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=True,
+                )
+                await bot.restrict_chat_member(chat_id, user_id, permissions=perms)
                 muted_users.pop(user_id, None)
+            else:
+                perms = ChatPermissions(
+                    can_send_messages=False,
+                    can_send_media_messages=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False,
+                )
+                until = datetime.now() + timedelta(seconds=mute_duration)
+                await bot.restrict_chat_member(
+                    chat_id, user_id, permissions=perms, until_date=until
+                )
+                muted_users[user_id] = until
             return True
-        except Exception as e:
-            logging.error(f"Restrict error: {e}")
+        except TelegramError as e:
+            logger.error("Restrict error: %s", e)
             return False
 
-    async def ban_user(chat_id, user_id):
+    async def ban_user(bot, chat_id: int, user_id: int) -> bool:
         try:
-            rights = ChatBannedRights(until_date=None, view_messages=True)
-            await client(EditBannedRequest(chat_id, user_id, rights))
+            await bot.ban_chat_member(chat_id, user_id)
             return True
-        except Exception as e:
-            logging.error(f"Ban error: {e}")
+        except TelegramError as e:
+            logger.error("Ban error: %s", e)
             return False
 
-    def vote_keyboard(target_id: int):
-        return [
-            [Button.inline("🔨 Блокировать", data=f"vote|ban|{target_id}".encode()),
-             Button.inline("✅ Не блокировать", data=f"vote|noban|{target_id}".encode())]
-        ]
+    def vote_keyboard(target_id: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔨 Блокировать", callback_data=f"vote|ban|{target_id}"),
+            InlineKeyboardButton("✅ Не блокировать", callback_data=f"vote|noban|{target_id}"),
+        ]])
 
     def build_vote_text(target_id: int, vote_data: dict) -> str:
         ban = sum(1 for v in vote_data["votes"].values() if v == "ban")
@@ -80,17 +97,20 @@ def register(
         voted = len(vote_data["votes"])
 
         text = (
-            f"🗳 **Голосование:** заблокировать пользователя `{target_id}`?\n\n"
-            f"🔨 За бан: **{ban}**\n"
-            f"✅ Против: **{noban}**\n"
+            f"🗳 <b>Голосование:</b> заблокировать пользователя "
+            f"<code>{target_id}</code>?\n\n"
+            f"🔨 За бан: <b>{ban}</b>\n"
+            f"✅ Против: <b>{noban}</b>\n"
             f"👥 Проголосовали: {voted}/{total}"
         )
         if voted:
-            vlist = ", ".join(f"@{uid}→{v}" for uid, v in vote_data["votes"].items())
+            vlist = ", ".join(f"@{esc(uid)}→{v}" for uid, v in vote_data["votes"].items())
             text += f"\n\n📝 Голоса: {vlist}"
         return text
 
-    async def finish_vote(chat_id: int, target_id: int, reason: str = "timeout"):
+    # ---------- завершение голосования ----------
+
+    async def finish_vote(bot, chat_id: int, target_id: int, reason: str = "timeout") -> None:
         vote_data = active_votes[chat_id].pop(target_id, None)
         if not vote_data:
             return
@@ -105,163 +125,214 @@ def register(
             and vote_data.get("initiator_username") in votes
             and votes[vote_data["initiator_username"]] == "ban"
         )
-
         ban_applied = False if only_initiator else (ban_votes > noban_votes and ban_votes >= 1)
 
         if ban_applied:
-            success = await ban_user(chat_id, target_id)
-            if success:
-                result = f"🔨 Пользователь `{target_id}` **забанен**. (за {ban_votes} / против {noban_votes})"
+            ok = await ban_user(bot, chat_id, target_id)
+            if ok:
+                result = (
+                    f"🔨 Пользователь <code>{target_id}</code> <b>забанен</b>. "
+                    f"(за {ban_votes} / против {noban_votes})"
+                )
             else:
-                result = f"❌ Ошибка бана пользователя `{target_id}`. Проверьте права бота."
+                result = (
+                    f"❌ Ошибка бана <code>{target_id}</code>. "
+                    f"Проверьте права бота."
+                )
         else:
-            result = f"✅ Пользователь `{target_id}` **не забанен**. (за {ban_votes} / против {noban_votes})"
+            result = (
+                f"✅ Пользователь <code>{target_id}</code> <b>не забанен</b>. "
+                f"(за {ban_votes} / против {noban_votes})"
+            )
             if target_id in muted_users:
-                await set_restrictions(chat_id, target_id, True)
+                await set_restrictions(bot, chat_id, target_id, True)
 
         try:
-            await client.edit_message(chat_id, vote_data["message_id"], result, buttons=None, parse_mode='md')
-        except Exception:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=vote_data["message_id"],
+                text=result,
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
             pass
 
         pending_admin_votes.pop(target_id, None)
-        await client.send_message(chat_id, result, parse_mode='md')
+        await bot.send_message(chat_id, result, parse_mode=ParseMode.HTML)
 
-    async def vote_timeout_task(chat_id: int, target_id: int):
-        await asyncio.sleep(vote_timeout)
+    async def vote_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id, target_id = context.job.data
         if chat_id in active_votes and target_id in active_votes[chat_id]:
-            await finish_vote(chat_id, target_id, reason="timeout")
+            await finish_vote(context.bot, chat_id, target_id, reason="timeout")
 
-    async def mute_timeout_task(chat_id: int, user_id: int):
-        await asyncio.sleep(mute_duration)
-        if user_id in muted_users and user_id not in active_votes.get(chat_id, {}):
-            await set_restrictions(chat_id, user_id, True)
+    # ---------- хэндлеры ----------
 
-    @client.on(events.NewMessage(pattern=r'(?i)^/?суд\s+@?(\w+)$'))
-    async def block_command(event):
-        chat_id = event.chat_id
-        initiator = await event.get_sender()
+    async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        chat_id = update.effective_chat.id
+        initiator = update.effective_user
+
+        parts = (msg.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await msg.reply_text(
+                "❌ Использование: <code>/суд @username</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        target_username = parts[1].strip().lstrip("@").lower()
+        if not target_username:
+            await msg.reply_text("❌ Укажите юзернейм.")
+            return
 
         if not check_daily_limit(initiator):
-            await event.reply("⛔ Вы исчерпали лимит запросов на суд (2 в день).")
+            await msg.reply_text("⛔ Вы исчерпали лимит запросов на суд (2 в день).")
             return
 
-        target_username = event.pattern_match.group(1)
-
         try:
-            target = await client.get_entity(f"@{target_username}")
+            target = await context.bot.get_chat(f"@{target_username}")
+            if getattr(target, "is_bot", False):
+                await msg.reply_text("❌ Нельзя блокировать ботов.")
+                return
             target_id = target.id
-            if target.bot:
-                await event.reply("❌ Нельзя блокировать ботов.")
-                return
             if target_id == initiator.id:
-                await event.reply("❌ Нельзя блокировать себя.")
+                await msg.reply_text("❌ Нельзя блокировать себя.")
                 return
-        except Exception as e:
-            await event.reply(f"❌ Не удалось найти `@{target_username}`. Ошибка: {e}", parse_mode='md')
+        except Exception:
+            await msg.reply_text(
+                f"❌ Не удалось найти <code>@{esc(target_username)}</code>.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         if chat_id in active_votes and target_id in active_votes[chat_id]:
-            await event.reply("⏳ Голосование по этому пользователю уже идёт.")
+            await msg.reply_text("⏳ Голосование по этому пользователю уже идёт.")
             return
 
         allowed_voters = set(holy_trinity)
         is_admin_initiator = is_holy_trinity(initiator)
         initiator_username = initiator.username.lower() if initiator.username else None
 
-        vote_msg = await event.reply(
+        vote_msg = await msg.reply_text(
             build_vote_text(target_id, {"votes": {}, "allowed_voters": allowed_voters}),
-            buttons=vote_keyboard(target_id),
-            parse_mode='md'
+            reply_markup=vote_keyboard(target_id),
+            parse_mode=ParseMode.HTML,
         )
 
         active_votes[chat_id][target_id] = {
             "initiator": initiator.id,
             "initiator_username": initiator_username,
             "votes": {},
-            "message_id": vote_msg.id,
+            "message_id": vote_msg.message_id,
             "started_by_admin": is_admin_initiator,
             "allowed_voters": allowed_voters,
         }
-        asyncio.create_task(vote_timeout_task(chat_id, target_id))
+        context.job_queue.run_once(
+            vote_timeout_job,
+            when=vote_timeout,
+            data=(chat_id, target_id),
+            name=f"vote_{chat_id}_{target_id}",
+        )
 
-    @client.on(events.CallbackQuery(pattern=r'^vote\|'))
-    async def vote_callback(event):
-        user = await event.get_sender()
-        data = event.data.decode()
-        _, action, target_str = data.split("|")
-        target_id = int(target_str)
-        chat_id = event.chat_id
+    async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        user = query.from_user
+        chat_id = update.effective_chat.id
+
+        try:
+            _, action, target_str = query.data.split("|")
+            target_id = int(target_str)
+        except ValueError:
+            await query.answer("Некорректные данные голосования.", show_alert=True)
+            return
 
         vote_data = active_votes.get(chat_id, {}).get(target_id)
         if not vote_data:
-            await event.answer("Голосование уже завершено.", alert=True)
+            await query.answer("Голосование уже завершено.", show_alert=True)
             return
 
         if not user.username:
-            await event.answer("У вас нет юзернейма, голос не может быть учтён.", alert=True)
+            await query.answer(
+                "У вас нет юзернейма, голос не может быть учтён.",
+                show_alert=True,
+            )
             return
 
         username = user.username.lower()
         if username not in vote_data["allowed_voters"]:
-            await event.answer("Вы не входите в совет голосующих.", alert=True)
+            await query.answer("Вы не входите в совет голосующих.", show_alert=True)
             return
 
         vote_data["votes"][username] = action
-        await event.answer("Голос учтён.")
+        await query.answer("Голос учтён.")
 
         try:
-            await event.edit(
+            await query.edit_message_text(
                 build_vote_text(target_id, vote_data),
-                buttons=vote_keyboard(target_id),
-                parse_mode='md'
+                reply_markup=vote_keyboard(target_id),
+                parse_mode=ParseMode.HTML,
             )
-        except Exception:
+        except TelegramError:
             pass
 
         if len(vote_data["votes"]) >= len(vote_data["allowed_voters"]):
-            await finish_vote(chat_id, target_id, reason="all_voted")
+            await finish_vote(context.bot, chat_id, target_id, reason="all_voted")
 
-    @client.on(events.NewMessage(pattern=r'(?i)^/?ожидание$'))
-    async def pending_command(event):
-        user = await event.get_sender()
+    async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
         if not is_holy_trinity(user):
             return
 
-        chat_id = event.chat_id
+        msg = update.effective_message
+        chat_id = update.effective_chat.id
         items = [(tid, d) for tid, d in pending_admin_votes.items() if d["chat_id"] == chat_id]
 
         if not items:
-            await event.reply("Нет отложенных голосований.")
+            await msg.reply_text("Нет отложенных голосований.")
             return
 
         for target_id, data in items:
-            if chat_id not in active_votes or target_id not in active_votes[chat_id]:
-                allowed = set(holy_trinity)
-                initiator_username = None
-                try:
-                    initiator_entity = await client.get_entity(data["initiator"])
-                    if initiator_entity.username:
-                        initiator_username = initiator_entity.username.lower()
-                except Exception:
-                    pass
+            if chat_id in active_votes and target_id in active_votes[chat_id]:
+                continue
 
-                vote_msg = await event.reply(
-                    build_vote_text(target_id, {"votes": {}, "allowed_voters": allowed}),
-                    buttons=vote_keyboard(target_id),
-                    parse_mode='md'
-                )
-                active_votes[chat_id][target_id] = {
-                    "initiator": data["initiator"],
-                    "initiator_username": initiator_username,
-                    "votes": {},
-                    "message_id": vote_msg.id,
-                    "started_by_admin": True,
-                    "allowed_voters": allowed,
-                }
-                asyncio.create_task(vote_timeout_task(chat_id, target_id))
+            allowed = set(holy_trinity)
+            initiator_username = None
+            try:
+                initiator_entity = await context.bot.get_chat(data["initiator"])
+                if getattr(initiator_entity, "username", None):
+                    initiator_username = initiator_entity.username.lower()
+            except Exception:
+                pass
+
+            vote_msg = await msg.reply_text(
+                build_vote_text(target_id, {"votes": {}, "allowed_voters": allowed}),
+                reply_markup=vote_keyboard(target_id),
+                parse_mode=ParseMode.HTML,
+            )
+            active_votes[chat_id][target_id] = {
+                "initiator": data["initiator"],
+                "initiator_username": initiator_username,
+                "votes": {},
+                "message_id": vote_msg.message_id,
+                "started_by_admin": True,
+                "allowed_voters": allowed,
+            }
+            context.job_queue.run_once(
+                vote_timeout_job,
+                when=vote_timeout,
+                data=(chat_id, target_id),
+                name=f"vote_{chat_id}_{target_id}",
+            )
 
         for tid, _ in items:
             pending_admin_votes.pop(tid, None)
 
-    logging.info("Moderation module: зарегистрированы 'суд', 'ожидание', vote-callback.")
+    app.add_handler(
+        MessageHandler(filters.Regex(r"^/?суд\s+@?\w+$", flags=re.IGNORECASE if (re := __import__("re")) else 0), block_command)
+    )
+    app.add_handler(CallbackQueryHandler(vote_callback, pattern=r"^vote\|"))
+    app.add_handler(
+        MessageHandler(filters.Regex(r"^/?ожидание$", flags=(__import__("re").IGNORECASE)), pending_command)
+    )
+
+    logger.info("Moderation module: 'суд', 'ожидание', vote-callback зарегистрированы.")
