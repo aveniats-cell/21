@@ -14,12 +14,12 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# === СОВЕТ ГОЛОСУЮЩИХ ===
+# === СОВЕТ ГОЛОСУЮЩИХ (РОВНО 3 ЧЕЛОВЕКА) ===
 HOLY_TRINITY_USERNAMES = {"youwarm", "ilyshadep", "naranjortiz"}
 
 MAX_REQUESTS_PER_DAY = 2
-VOTE_TIMEOUT = 300
-MUTE_DURATION = 60 * 60 * 24
+VOTE_TIMEOUT = 300            # 5 минут
+MUTE_DURATION = 60 * 60 * 24  # 24 часа
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -66,14 +66,28 @@ async def main():
     logging.info("Бот запущен через MTProto (Telethon)! Готов к работе.")
 
     # === РЕГИСТРАЦИЯ МОДУЛЕЙ ===
-    # Импортируем после старта клиента, чтобы не было циклических импортов
+    # Импортируем здесь, после старта клиента, чтобы не было проблем с инициализацией
     import moderation
-    import fun
+    import cubic
+    import meme
 
-    moderation.register(client)
-    fun.register(client)
+    # Передаём клиенту и все общие объекты явно — без import main из модулей
+    moderation.register(
+        client=client,
+        active_votes=active_votes,
+        muted_users=muted_users,
+        pending_admin_votes=pending_admin_votes,
+        daily_requests=daily_requests,
+        holy_trinity=HOLY_TRINITY_USERNAMES,
+        max_requests=MAX_REQUESTS_PER_DAY,
+        vote_timeout=VOTE_TIMEOUT,
+        mute_duration=MUTE_DURATION,
+    )
 
-    logging.info("✅ Модули moderation и fun подключены.")
+    cubic.register(client=client)
+    meme.register(client=client)
+
+    logging.info("✅ Модули moderation, cubic и meme подключены.")
 
     await client.run_until_disconnected()
 
