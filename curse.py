@@ -1,33 +1,46 @@
 import logging
+import re
 import time
-import aiohttp
-from telethon import events
+from html import escape as esc
 
-_coins_cache = None
-_coins_cache_time = 0
+import aiohttp
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import ContextTypes, MessageHandler, filters
+
+logger = logging.getLogger(__name__)
+
+_coins_cache: list | None = None
+_coins_cache_time = 0.0
 CACHE_TTL = 3600
 
+CURSE_RE = re.compile(r"^/?курс\s+(.+)$", re.IGNORECASE)
 
-async def _get_all_coins():
+
+async def _get_all_coins() -> list:
     global _coins_cache, _coins_cache_time
     now = time.time()
     if _coins_cache and (now - _coins_cache_time) < CACHE_TTL:
         return _coins_cache
 
     url = "https://api.coinpaprika.com/v1/coins"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status != 200:
-                return _coins_cache or []
-            data = await resp.json()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return _coins_cache or []
+                data = await resp.json()
+    except Exception as e:
+        logger.warning("Curse: не удалось загрузить список монет: %s", e)
+        return _coins_cache or []
 
     _coins_cache = data
     _coins_cache_time = now
-    logging.info(f"Curse: загружено {len(data)} монет с CoinPaprika")
+    logger.info("Curse: загружено %s монет с CoinPaprika", len(data))
     return data
 
 
-def _find_coin(query, coins):
+def _find_coin(query: str, coins: list) -> dict | None:
     q = query.lower().strip()
     for c in coins:
         if c.get("symbol", "").lower() == q:
@@ -41,24 +54,26 @@ def _find_coin(query, coins):
     return None
 
 
-def register(client):
-    @client.on(events.NewMessage(pattern=r'(?i)^/?курс\s+(.+)$'))
-    async def curse_cmd(event):
-        query = event.pattern_match.group(1).strip()
-
-        try:
-            coins = await _get_all_coins()
-        except Exception as e:
-            await event.reply(f"❌ Ошибка загрузки списка монет: {e}")
+def register(app) -> None:
+    async def curse_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        m = CURSE_RE.match(msg.text or "")
+        if not m:
             return
+        query = m.group(1).strip()
 
+        coins = await _get_all_coins()
         if not coins:
-            await event.reply("❌ Не удалось загрузить список монет. Попробуй позже.")
+            await msg.reply_text("❌ Не удалось загрузить список монет. Попробуй позже.")
             return
 
         coin = _find_coin(query, coins)
         if not coin:
-            await event.reply(f"❌ Монета «{query}» не найдена. Попробуй тикер (btc) или название (bitcoin).")
+            await msg.reply_text(
+                f"❌ Монета «{esc(query)}» не найдена. "
+                f"Попробуй тикер (btc) или название (bitcoin).",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         coin_id = coin["id"]
@@ -67,11 +82,11 @@ def register(client):
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status != 200:
-                        await event.reply("❌ Не удалось получить цену.")
+                        await msg.reply_text("❌ Не удалось получить цену.")
                         return
                     data = await resp.json()
         except Exception as e:
-            await event.reply(f"❌ Ошибка запроса: {e}")
+            await msg.reply_text(f"❌ Ошибка запроса: {esc(str(e))}", parse_mode=ParseMode.HTML)
             return
 
         name = data.get("name", coin.get("name", coin_id))
@@ -82,16 +97,18 @@ def register(client):
         mcap = usd.get("market_cap", 0) or 0
 
         if price is None:
-            await event.reply("❌ Не удалось получить цену.")
+            await msg.reply_text("❌ Не удалось получить цену.")
             return
 
         arrow = "📈" if change >= 0 else "📉"
-        await event.reply(
-            f"💰 **{name} ({symbol})**\n"
-            f"Цена: **${price:,.2f}**\n"
-            f"{arrow} За 24ч: **{change:+.2f}%**\n"
+        await msg.reply_text(
+            f"💰 <b>{esc(name)} ({esc(symbol)})</b>\n"
+            f"Цена: <b>${price:,.2f}</b>\n"
+            f"{arrow} За 24ч: <b>{change:+.2f}%</b>\n"
             f"🏦 Капитализация: ${mcap:,.0f}",
-            parse_mode='md'
+            parse_mode=ParseMode.HTML,
         )
 
-    logging.info("Curse module: зарегистрирован 'курс <монета>'.")
+    app.add_handler(MessageHandler(filters.Regex(CURSE_RE), curse_cmd))
+
+    logger.info("Curse module: 'курс <монета>' зарегистрирован.")
