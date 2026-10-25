@@ -12,7 +12,7 @@ from telegram.ext import (
 
 # === НАСТРОЙКИ ===
 # ВНИМАНИЕ: Токен в коде виден всем, у кого есть доступ к файлу на GitHub.
-BOT_TOKEN = "8806416760:AAE-NUsbDmaF_WfMvRZdoF_y9ideWzpx37E" 
+BOT_TOKEN = "8860539571:AAENw5L5XcDSaq3aL7nMqVjXGIkreQRT3Tg" 
 HOLY_TRINITY = {1319217425, 5376112672, 855714453}  # «святая тройка»
 MAX_REQUESTS_PER_DAY = 2
 VOTE_TIMEOUT = 300            # 5 минут
