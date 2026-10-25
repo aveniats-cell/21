@@ -11,14 +11,17 @@ from telegram.ext import (
 )
 
 # === НАСТРОЙКИ ===
-# ВНИМАНИЕ: Токен в коде виден всем, у кого есть доступ к файлу.
-BOT_TOKEN = "8806416760:AAE-NUsbDmaF_WfMvRZdoF_y9ideWzpx37E"  # ← Замените на новый, если отзовете старый
+# ВНИМАНИЕ: Токен в коде виден всем, у кого есть доступ к файлу на GitHub.
+BOT_TOKEN = "8806416760:AAE-NUsbDmaF_WfMvRZdoF_y9ideWzpx37E" 
 HOLY_TRINITY = {1319217425, 5376112672, 855714453}  # «святая тройка»
 MAX_REQUESTS_PER_DAY = 2
 VOTE_TIMEOUT = 300            # 5 минут
 MUTE_DURATION = 60 * 60 * 24  # 24 часа мут (если голосование не завершится)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
 # === ФИКТИВНЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ===
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -27,7 +30,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
     def log_message(self, format, *args):
-        pass
+        pass # Отключаем спам логами
 
 def run_health_server():
     port = int(os.environ.get("PORT", 10000))
@@ -343,6 +346,13 @@ async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    # Защита от падения на Python 3.14+ из-за отсутствия event loop
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     # Запускаем фоновый веб-сервер для Render
     threading.Thread(target=run_health_server, daemon=True).start()
     logging.info("Фоновый веб-сервер для Render успешно запущен.")
