@@ -1,104 +1,127 @@
 import asyncio
+import logging
 import random
 import re
-import logging
+import time
+from html import escape as esc
 
-from telethon import events
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import ContextTypes, MessageHandler, filters
+
+logger = logging.getLogger(__name__)
+
+ROLL_RE = re.compile(r"^/?удача\s+(.+)$", re.IGNORECASE)
+COIN_RE = re.compile(r"^/?монетка$", re.IGNORECASE)
+DICE_RE = re.compile(r"^/?кубик(?:\s+(\S+))?$", re.IGNORECASE)
+RANDOM_RE = re.compile(r"^/?рандом(?:\s+(\d+)\s+(\d+))?$", re.IGNORECASE)
+BALL_RE = re.compile(r"^/?шар\s+(.+)$", re.IGNORECASE)
+PING_RE = re.compile(r"^/?пинг$", re.IGNORECASE)
 
 
-def register(client):
-    @client.on(events.NewMessage(pattern=r'(?i)^/?удача\s+(.+)$'))
-    async def cubic_cmd(event):
-        text = event.pattern_match.group(1).strip()
+def register(app) -> None:
+    async def cubic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        m = ROLL_RE.match(msg.text or "")
+        if not m:
+            return
+        text = m.group(1).strip()
 
-        raw = re.split(r'[,;]|\s+или\s+', text)
-        options = [o.strip() for o in raw if o.strip()]
-
+        options = [o.strip() for o in re.split(r"[,;]|\s+или\s+", text) if o.strip()]
         if len(options) < 2:
-            await event.reply("❌ Нужно минимум 2 варианта, разделённых запятой.", parse_mode='md')
+            await msg.reply_text("❌ Нужно минимум 2 варианта, разделённых запятой.")
             return
         if len(options) > 30:
-            await event.reply("❌ Слишком много вариантов (максимум 30).", parse_mode='md')
+            await msg.reply_text("❌ Слишком много вариантов (максимум 30).")
             return
 
-        spin_msg = await event.reply("🎰 Крутим рулетку...")
-
-        delays = [0.08, 0.10, 0.13, 0.16, 0.20, 0.25, 0.32, 0.40, 0.50]
-        for delay in delays:
+        spin_msg = await msg.reply_text("🎰 Крутим рулетку...")
+        for delay in (0.08, 0.10, 0.13, 0.16, 0.20, 0.25, 0.32, 0.40, 0.50):
             frame = random.choice(options)
             try:
-                await spin_msg.edit(f"🎰 Крутим... **{frame}**", parse_mode='md')
+                await spin_msg.edit_text(f"🎰 Крутим... <b>{esc(frame)}</b>", parse_mode=ParseMode.HTML)
             except Exception:
                 pass
             await asyncio.sleep(delay)
 
         winner = random.choice(options)
-
-        if len(options) <= 10:
-            opts_display = ", ".join(options)
-        else:
-            opts_display = ", ".join(options[:10]) + f" и ещё {len(options) - 10}..."
+        opts_display = (
+            ", ".join(esc(o) for o in options)
+            if len(options) <= 10
+            else ", ".join(esc(o) for o in options[:10]) + f" и ещё {len(options) - 10}..."
+        )
 
         try:
-            await spin_msg.edit(
-                f"🎰 **Рулетка завершена!**\n\n"
+            await spin_msg.edit_text(
+                f"🎰 <b>Рулетка завершена!</b>\n\n"
                 f"📋 Варианты: {opts_display}\n\n"
-                f"🎯 Выпало: **{winner}**",
-                parse_mode='md'
+                f"🎯 Выпало: <b>{esc(winner)}</b>",
+                parse_mode=ParseMode.HTML,
             )
         except Exception:
-            await event.reply(f"🎰 Выпало: **{winner}**", parse_mode='md')
+            await msg.reply_text(f"🎰 Выпало: <b>{esc(winner)}</b>", parse_mode=ParseMode.HTML)
 
-    @client.on(events.NewMessage(pattern=r'(?i)^/?монетка$'))
-    async def coin_cmd(event):
-        result = random.choice(["🪙 **Орёл!**", "🪙 **Решка!**"])
-        await event.reply(result, parse_mode='md')
+    async def coin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.effective_message.reply_text(
+            random.choice(["🪙 <b>Орёл!</b>", "🪙 <b>Решка!</b>"]),
+            parse_mode=ParseMode.HTML,
+        )
 
-    @client.on(events.NewMessage(pattern=r'(?i)^/?кубик(?:\s+(\S+))?$'))
-    async def roll_cmd(event):
-        dice = event.pattern_match.group(1) or "1d6"
-        m = re.fullmatch(r'(\d*)d(\d+)', dice.lower())
-        if not m:
-            await event.reply("❌ Формат: `кубик 2d6` или `кубик d20`", parse_mode='md')
+    async def roll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        m = DICE_RE.match(msg.text or "")
+        dice = (m.group(1) if m and m.group(1) else "1d6")
+        mm = re.fullmatch(r"(\d*)d(\d+)", dice.lower())
+        if not mm:
+            await msg.reply_text("❌ Формат: <code>кубик 2d6</code> или <code>кубик d20</code>",
+                                 parse_mode=ParseMode.HTML)
             return
-        count = int(m.group(1)) if m.group(1) else 1
-        sides = int(m.group(2))
+        count = int(mm.group(1)) if mm.group(1) else 1
+        sides = int(mm.group(2))
         if count < 1 or count > 20 or sides < 2 or sides > 1000:
-            await event.reply("❌ Слишком много кубиков или граней.")
+            await msg.reply_text("❌ Слишком много кубиков или граней.")
             return
         rolls = [random.randint(1, sides) for _ in range(count)]
         total = sum(rolls)
         detail = " + ".join(map(str, rolls)) if count > 1 else str(rolls[0])
-        await event.reply(f"🎲 **{dice}** → {detail}" + (f" = **{total}**" if count > 1 else ""), parse_mode='md')
+        suffix = f" = <b>{total}</b>" if count > 1 else ""
+        await msg.reply_text(f"🎲 <b>{esc(dice)}</b> → {detail}{suffix}", parse_mode=ParseMode.HTML)
 
-    @client.on(events.NewMessage(pattern=r'(?i)^/?рандом(?:\s+(\d+)\s+(\d+))?$'))
-    async def random_cmd(event):
-        a_str = event.pattern_match.group(1)
-        b_str = event.pattern_match.group(2)
-        if not a_str or not b_str:
-            await event.reply("❌ Использование: `рандом 1 100`", parse_mode='md')
+    async def random_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        m = RANDOM_RE.match(msg.text or "")
+        if not m or not m.group(1) or not m.group(2):
+            await msg.reply_text("❌ Использование: <code>рандом 1 100</code>", parse_mode=ParseMode.HTML)
             return
-        a, b = int(a_str), int(b_str)
+        a, b = int(m.group(1)), int(m.group(2))
         if a > b:
             a, b = b, a
-        await event.reply(f"🎯 Случайное число: **{random.randint(a, b)}**", parse_mode='md')
+        await msg.reply_text(f"🎯 Случайное число: <b>{random.randint(a, b)}</b>",
+                             parse_mode=ParseMode.HTML)
 
-    @client.on(events.NewMessage(pattern=r'(?i)^/?шар\s+(.+)$'))
-    async def ball_cmd(event):
-        text = event.pattern_match.group(1).strip()
+    async def ball_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not BALL_RE.match(msg.text or ""):
+            return
         answers = [
             "✅ Да, определённо.", "✅ Безусловно.", "✅ Скорее да.",
             "🤔 Возможно.", "🤔 Не уверен.", "🤔 Спроси позже.",
-            "❌ Скорее нет.", "❌ Не рассчитывай.", "❌ Нет."
+            "❌ Скорее нет.", "❌ Не рассчитывай.", "❌ Нет.",
         ]
-        await event.reply(f"🎱 {random.choice(answers)}", parse_mode='md')
+        await msg.reply_text(f"🎱 {random.choice(answers)}", parse_mode=ParseMode.HTML)
 
-    @client.on(events.NewMessage(pattern=r'(?i)^/?пинг$'))
-    async def ping_cmd(event):
-        import time
+    async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
         start = time.time()
-        msg = await event.reply("🏓 Pong...")
+        sent = await msg.reply_text("🏓 Pong...")
         ms = (time.time() - start) * 1000
-        await msg.edit(f"🏓 **Pong!** `{ms:.0f}ms`", parse_mode='md')
+        await sent.edit_text(f"🏓 <b>Pong!</b> <code>{ms:.0f}ms</code>", parse_mode=ParseMode.HTML)
 
-    logging.info("Cubic module: зарегистрированы 'удача', 'монетка', 'кубик', 'рандом', 'шар', 'пинг'.")
+    app.add_handler(MessageHandler(filters.Regex(ROLL_RE), cubic_cmd))
+    app.add_handler(MessageHandler(filters.Regex(COIN_RE), coin_cmd))
+    app.add_handler(MessageHandler(filters.Regex(DICE_RE), roll_cmd))
+    app.add_handler(MessageHandler(filters.Regex(RANDOM_RE), random_cmd))
+    app.add_handler(MessageHandler(filters.Regex(BALL_RE), ball_cmd))
+    app.add_handler(MessageHandler(filters.Regex(PING_RE), ping_cmd))
+
+    logger.info("Cubic module: 'удача', 'монетка', 'кубик', 'рандом', 'шар', 'пинг' зарегистрированы.")
