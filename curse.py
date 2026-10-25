@@ -1,16 +1,15 @@
 import logging
+import time
 import aiohttp
 from telethon import events
 
-# Кэш: список всех монет (id, name, symbol)
 _coins_cache = None
 _coins_cache_time = 0
-CACHE_TTL = 3600  # обновлять раз в час
+CACHE_TTL = 3600
+
 
 async def _get_all_coins():
-    """Загружает список всех монет с CoinPaprika (кэширует на час)."""
     global _coins_cache, _coins_cache_time
-    import time
     now = time.time()
     if _coins_cache and (now - _coins_cache_time) < CACHE_TTL:
         return _coins_cache
@@ -22,31 +21,28 @@ async def _get_all_coins():
                 return _coins_cache or []
             data = await resp.json()
 
-    # data — список объектов {"id": "btc-bitcoin", "name": "Bitcoin", "symbol": "BTC", ...}
     _coins_cache = data
     _coins_cache_time = now
     logging.info(f"Curse: загружено {len(data)} монет с CoinPaprika")
     return data
 
+
 def _find_coin(query, coins):
-    """Ищет монету по тикеру или названию (без учёта регистра)."""
     q = query.lower().strip()
-    # 1. Точное совпадение по тикеру (BTC)
     for c in coins:
         if c.get("symbol", "").lower() == q:
             return c
-    # 2. Точное совпадение по названию (Bitcoin)
     for c in coins:
         if c.get("name", "").lower() == q:
             return c
-    # 3. Частичное совпадение по названию (bitcoi)
     for c in coins:
         if q in c.get("name", "").lower():
             return c
     return None
 
+
 def register(client):
-    @client.on(events.NewMessage(pattern=r'^/curse\s+(.+)'))
+    @client.on(events.NewMessage(pattern=r'(?i)^/?курс\s+(.+)$'))
     async def curse_cmd(event):
         query = event.pattern_match.group(1).strip()
 
@@ -98,4 +94,4 @@ def register(client):
             parse_mode='md'
         )
 
-    logging.info("Curse module: зарегистрирован /curse (поиск по всем монетам).")
+    logging.info("Curse module: зарегистрирован 'курс <монета>'.")
