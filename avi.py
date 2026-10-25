@@ -15,7 +15,9 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-HOLY_TRINITY = {1319217425, 5376112672, 855714453}
+# ВМЕСТО ID ИСПОЛЬЗУЕМ ЮЗЕРНЕЙМЫ (в нижнем регистре!)
+HOLY_TRINITY_USERNAMES = {"youwarm", "ilyshadep", "sadist_perfection"}
+
 MAX_REQUESTS_PER_DAY = 2
 VOTE_TIMEOUT = 300            # 5 минут
 MUTE_DURATION = 60 * 60 * 24  # 24 часа
@@ -46,17 +48,22 @@ muted_users = {}
 pending_admin_votes = {}
 
 # === КЛИЕНТ ===
-# StringSession() с пустыми скобками означает "работаем в памяти, файлы не создаем"
 client = TelegramClient(StringSession(), API_ID, API_HASH)
 
 # === ВСПОМОГАТЕЛЬНЫЕ ===
-def check_daily_limit(user_id: int) -> bool:
+def is_holy_trinity(user) -> bool:
+    """Проверяет, входит ли пользователь в святую тройку по юзернейму."""
+    if not user or not user.username:
+        return False
+    return user.username.lower() in HOLY_TRINITY_USERNAMES
+
+def check_daily_limit(user) -> bool:
     today = datetime.date.today()
-    rec = daily_requests[user_id]
+    rec = daily_requests[user.id]
     if rec["date"] != today:
         rec["date"] = today
         rec["count"] = 0
-    if user_id in HOLY_TRINITY:
+    if is_holy_trinity(user):
         return True
     if rec["count"] < MAX_REQUESTS_PER_DAY:
         rec["count"] += 1
@@ -171,7 +178,7 @@ async def block_command(event):
     chat_id = event.chat_id
     initiator = await event.get_sender()
     
-    if not check_daily_limit(initiator.id):
+    if not check_daily_limit(initiator):
         await event.reply("⛔ Вы исчерпали лимит запросов на блок (2 в день).")
         return
 
@@ -200,18 +207,17 @@ async def block_command(event):
         await event.reply("⏳ Голосование по этому пользователю уже идёт.")
         return
 
-    # Собираем совет
+    # Собираем совет по ЮЗЕРНЕЙМАМ
     voters = []
     try:
         participants = await client.get_participants(chat_id)
-        participant_ids = {p.id for p in participants}
-        for admin_id in HOLY_TRINITY:
-            if admin_id in participant_ids:
-                voters.append(admin_id)
+        for p in participants:
+            if is_holy_trinity(p):
+                voters.append(p.id)
     except Exception as e:
         logging.error(f"Participants error: {e}")
 
-    is_admin_initiator = initiator.id in HOLY_TRINITY
+    is_admin_initiator = is_holy_trinity(initiator)
     if is_admin_initiator and initiator.id not in voters:
         voters.append(initiator.id)
 
@@ -261,9 +267,14 @@ async def vote_callback(event):
         await event.answer("Голосование уже завершено.", alert=True)
         return
 
-    if user.id not in vote_data["allowed_voters"]:
+    # Проверяем, что голосует либо тот, кто в списке, либо святой
+    if user.id not in vote_data["allowed_voters"] and not is_holy_trinity(user):
         await event.answer("Вы не входите в совет голосующих.", alert=True)
         return
+        
+    # Если святой зашел, но его не было в списке (например, зашел позже) - добавляем
+    if is_holy_trinity(user) and user.id not in vote_data["allowed_voters"]:
+        vote_data["allowed_voters"].add(user.id)
 
     vote_data["votes"][user.id] = action
     await event.answer("Голос учтён.")
@@ -284,7 +295,7 @@ async def vote_callback(event):
 @client.on(events.NewMessage(pattern=r'^/pending'))
 async def pending_command(event):
     user = await event.get_sender()
-    if user.id not in HOLY_TRINITY:
+    if not is_holy_trinity(user):
         return
         
     chat_id = event.chat_id
@@ -296,7 +307,19 @@ async def pending_command(event):
 
     for target_id, data in items:
         if chat_id not in active_votes or target_id not in active_votes[chat_id]:
-            allowed = set(HOLY_TRINITY) | {data["initiator"]}
+            # Собираем всех святых, кто есть в чате
+            allowed = set()
+            try:
+                participants = await client.get_participants(chat_id)
+                for p in participants:
+                    if is_holy_trinity(p):
+                        allowed.add(p.id)
+            except:
+                pass
+            
+            if data["initiator"] not in allowed:
+                allowed.add(data["initiator"])
+
             vote_msg = await event.reply(
                 build_vote_text(target_id, {"votes": {}, "allowed_voters": allowed}),
                 buttons=vote_keyboard(target_id),
@@ -306,7 +329,7 @@ async def pending_command(event):
                 "initiator": data["initiator"],
                 "votes": {},
                 "message_id": vote_msg.id,
-                "started_by_admin": data["initiator"] in HOLY_TRINITY,
+                "started_by_admin": True, # Инициатор был святым
                 "allowed_voters": allowed,
             }
             asyncio.create_task(vote_timeout_task(chat_id, target_id))
@@ -320,15 +343,13 @@ async def main():
         logging.error("❌ ОШИБКА: Не заданы переменные окружения (API_ID, API_HASH или BOT_TOKEN)!")
         return
 
-    # Запускаем сервер для Render в фоне
     threading.Thread(target=run_health_server, daemon=True).start()
     logging.info("Фоновый веб-сервер для Render успешно запущен.")
 
-    # Запускаем MTProto клиент (он сам авторизуется по токену)
     await client.start(bot_token=BOT_TOKEN)
     logging.info("Бот запущен через MTProto (Telethon)! Готов к работе.")
     
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
