@@ -8,11 +8,11 @@ from telethon import events
 def register(client):
     """Вызывается из main.py после старта клиента."""
 
-    @client.on(events.NewMessage(pattern=r'^/шип'))
+    @client.on(events.NewMessage(pattern=r'^/ship'))
     async def ship_cmd(event):
         args = event.message.text.split()
         if len(args) < 3:
-            await event.reply("❌ Использование: `/шип @user1 @user2`", parse_mode='md')
+            await event.reply("❌ Использование: `/ship @user1 @user2`", parse_mode='md')
             return
 
         try:
@@ -49,4 +49,4 @@ def register(client):
             parse_mode='md'
         )
 
-    logging.info("Ship module: зарегистрирован /шип.")
+    logging.info("Ship module: зарегистрирован /ship.")
