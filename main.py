@@ -66,10 +66,11 @@ async def main():
     logging.info("Бот запущен через MTProto (Telethon)! Готов к работе.")
 
     # === РЕГИСТРАЦИЯ МОДУЛЕЙ ===
-    # Импортируем здесь, после старта клиента, чтобы не было проблем с инициализацией
     import moderation
     import cubic
     import ship
+    import curse
+    import wea
 
     moderation.register(
         client=client,
@@ -85,8 +86,10 @@ async def main():
 
     cubic.register(client=client)
     ship.register(client=client)
+    curse.register(client=client)
+    wea.register(client=client)
 
-    logging.info("✅ Модули moderation, cubic и ship подключены.")
+    logging.info("✅ Модули moderation, cubic, ship, curse, wea подключены.")
 
     await client.run_until_disconnected()
 
