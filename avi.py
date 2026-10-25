@@ -352,4 +352,5 @@ async def main():
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    main()
+    # ВОТ ЗДЕСЬ БЫЛА ОШИБКА, ТЕПЕРЬ ИСПОЛЬЗУЕТСЯ asyncio.run()
+    asyncio.run(main())
