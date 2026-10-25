@@ -8,7 +8,7 @@ from telegram.ext import (
 )
 
 # === НАСТРОЙКИ ===
-BOT_TOKEN = "YOUR_BOT_TOKEN"  # ← замените на реальный токен
+BOT_TOKEN = "8806416760:AAE-NUsbDmaF_WfMvRZdoF_y9ideWzpx37E"  # ← замените на реальный токен
 HOLY_TRINITY = {1319217425, 5376112672, 855714453}  # «святая тройка»
 MAX_REQUESTS_PER_DAY = 2
 VOTE_TIMEOUT = 300            # 5 минут
