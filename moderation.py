@@ -7,7 +7,6 @@ from telethon.tl.functions.channels import EditBannedRequest
 from telethon.tl.types import ChatBannedRights
 
 
-# === РЕГИСТРАЦИЯ ВСЕХ ХЭНДЛЕРОВ МОДУЛЯ ===
 def register(
     client,
     active_votes,
@@ -19,11 +18,6 @@ def register(
     vote_timeout,
     mute_duration,
 ):
-    """
-    Все зависимости передаются явно — никакого import main, никакого раздвоения состояния.
-    """
-
-    # === ВСПОМОГАТЕЛЬНЫЕ ===
     def is_holy_trinity(user) -> bool:
         if not user or not user.username:
             return False
@@ -73,7 +67,6 @@ def register(
             logging.error(f"Ban error: {e}")
             return False
 
-    # === КЛАВИАТУРА И ТЕКСТ ===
     def vote_keyboard(target_id: int):
         return [
             [Button.inline("🔨 Блокировать", data=f"vote|ban|{target_id}".encode()),
@@ -97,7 +90,6 @@ def register(
             text += f"\n\n📝 Голоса: {vlist}"
         return text
 
-    # === ЗАВЕРШЕНИЕ ГОЛОСОВАНИЯ ===
     async def finish_vote(chat_id: int, target_id: int, reason: str = "timeout"):
         vote_data = active_votes[chat_id].pop(target_id, None)
         if not vote_data:
@@ -145,22 +137,16 @@ def register(
         if user_id in muted_users and user_id not in active_votes.get(chat_id, {}):
             await set_restrictions(chat_id, user_id, True)
 
-    # === /block ===
-    @client.on(events.NewMessage(pattern=r'^/block'))
+    @client.on(events.NewMessage(pattern=r'(?i)^/?суд\s+@?(\w+)$'))
     async def block_command(event):
         chat_id = event.chat_id
         initiator = await event.get_sender()
 
         if not check_daily_limit(initiator):
-            await event.reply("⛔ Вы исчерпали лимит запросов на блок (2 в день).")
+            await event.reply("⛔ Вы исчерпали лимит запросов на суд (2 в день).")
             return
 
-        args = event.message.text.split()
-        if len(args) < 2:
-            await event.reply("Использование: `/block @username`", parse_mode='md')
-            return
-
-        target_username = args[1].lstrip("@")
+        target_username = event.pattern_match.group(1)
 
         try:
             target = await client.get_entity(f"@{target_username}")
@@ -199,7 +185,6 @@ def register(
         }
         asyncio.create_task(vote_timeout_task(chat_id, target_id))
 
-    # === КНОПКИ ===
     @client.on(events.CallbackQuery(pattern=r'^vote\|'))
     async def vote_callback(event):
         user = await event.get_sender()
@@ -237,8 +222,7 @@ def register(
         if len(vote_data["votes"]) >= len(vote_data["allowed_voters"]):
             await finish_vote(chat_id, target_id, reason="all_voted")
 
-    # === /pending ===
-    @client.on(events.NewMessage(pattern=r'^/pending'))
+    @client.on(events.NewMessage(pattern=r'(?i)^/?ожидание$'))
     async def pending_command(event):
         user = await event.get_sender()
         if not is_holy_trinity(user):
@@ -280,4 +264,4 @@ def register(
         for tid, _ in items:
             pending_admin_votes.pop(tid, None)
 
-    logging.info("Moderation module: зарегистрированы /block, /pending, vote-callback.")
+    logging.info("Moderation module: зарегистрированы 'суд', 'ожидание', vote-callback.")
