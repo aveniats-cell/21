@@ -15,7 +15,8 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-HOLY_TRINITY_USERNAMES = {"youwarm", "ilyshadep", "sadist_perfection"}
+# === СОВЕТ ГОЛОСУЮЩИХ (РОВНО 3 ЧЕЛОВЕКА) ===
+HOLY_TRINITY_USERNAMES = {"youwarm", "ilyshadep", "naranjortiz"}
 
 MAX_REQUESTS_PER_DAY = 2
 VOTE_TIMEOUT = 300            # 5 минут
@@ -51,6 +52,7 @@ client = TelegramClient(StringSession(), API_ID, API_HASH)
 
 # === ВСПОМОГАТЕЛЬНЫЕ ===
 def is_holy_trinity(user) -> bool:
+    """Проверяет, входит ли пользователь в совет по юзернейму."""
     if not user or not user.username:
         return False
     return user.username.lower() in HOLY_TRINITY_USERNAMES
@@ -118,7 +120,7 @@ def build_vote_text(target_id: int, vote_data: dict) -> str:
         f"👥 Проголосовали: {voted}/{total}"
     )
     if voted:
-        vlist = ", ".join(f"`{uid}`→{v}" for uid, v in vote_data["votes"].items())
+        vlist = ", ".join(f"@{uid}→{v}" for uid, v in vote_data["votes"].items())
         text += f"\n\n📝 Голоса: {vlist}"
     return text
 
@@ -132,11 +134,12 @@ async def finish_vote(chat_id: int, target_id: int, reason: str = "timeout"):
     ban_votes = sum(1 for v in votes.values() if v == "ban")
     noban_votes = sum(1 for v in votes.values() if v == "noban")
 
+    # Если единственный голос — от инициатора-админа за бан, то бан не применяем
     only_initiator = (
         vote_data.get("started_by_admin")
         and len(votes) == 1
-        and vote_data.get("initiator") in votes
-        and votes[vote_data["initiator"]] == "ban"
+        and vote_data.get("initiator_username") in votes
+        and votes[vote_data["initiator_username"]] == "ban"
     )
 
     ban_applied = False if only_initiator else (ban_votes > noban_votes and ban_votes >= 1)
@@ -187,6 +190,7 @@ async def block_command(event):
     
     target_username = args[1].lstrip("@")
 
+    # Поиск цели
     try:
         target = await client.get_entity(f"@{target_username}")
         target_id = target.id
@@ -204,46 +208,28 @@ async def block_command(event):
         await event.reply("⏳ Голосование по этому пользователю уже идёт.")
         return
 
-    voters = []
-    try:
-        participants = await client.get_participants(chat_id)
-        for p in participants:
-            if is_holy_trinity(p):
-                voters.append(p.id)
-    except Exception as e:
-        logging.error(f"Participants error: {e}")
-
+    # Совет голосующих — всегда ровно три человека
+    allowed_voters = set(HOLY_TRINITY_USERNAMES)
     is_admin_initiator = is_holy_trinity(initiator)
-    if is_admin_initiator and initiator.id not in voters:
-        voters.append(initiator.id)
+    initiator_username = initiator.username.lower() if initiator.username else None
 
-    if not voters:
-        await set_restrictions(chat_id, target_id, False)
-        pending_admin_votes[target_id] = {
-            "chat_id": chat_id,
-            "initiator": initiator.id,
-            "target_id": target_id,
-        }
-        asyncio.create_task(mute_timeout_task(chat_id, target_id))
-        await event.reply(
-            f"⚠️ Никого из совета нет онлайн. Пользователь `{target_id}` ограничен в сообщениях. "
-            f"Как только админ зайдёт — `/pending` и проголосует.",
-            parse_mode='md'
-        )
-        return
+    # Если инициатор не из совета, он всё равно не получает права голоса
+    # (но голосование всё равно запускается, совет проголосует)
 
+    # Запуск голосования
     vote_msg = await event.reply(
-        build_vote_text(target_id, {"votes": {}, "allowed_voters": set(voters)}),
+        build_vote_text(target_id, {"votes": {}, "allowed_voters": allowed_voters}),
         buttons=vote_keyboard(target_id),
         parse_mode='md'
     )
 
     active_votes[chat_id][target_id] = {
         "initiator": initiator.id,
+        "initiator_username": initiator_username,
         "votes": {},
         "message_id": vote_msg.id,
         "started_by_admin": is_admin_initiator,
-        "allowed_voters": set(voters),
+        "allowed_voters": allowed_voters,
     }
     asyncio.create_task(vote_timeout_task(chat_id, target_id))
 
@@ -261,14 +247,16 @@ async def vote_callback(event):
         await event.answer("Голосование уже завершено.", alert=True)
         return
 
-    if user.id not in vote_data["allowed_voters"] and not is_holy_trinity(user):
+    if not user.username:
+        await event.answer("У вас нет юзернейма, голос не может быть учтён.", alert=True)
+        return
+
+    username = user.username.lower()
+    if username not in vote_data["allowed_voters"]:
         await event.answer("Вы не входите в совет голосующих.", alert=True)
         return
-        
-    if is_holy_trinity(user) and user.id not in vote_data["allowed_voters"]:
-        vote_data["allowed_voters"].add(user.id)
 
-    vote_data["votes"][user.id] = action
+    vote_data["votes"][username] = action
     await event.answer("Голос учтён.")
     
     try:
@@ -280,6 +268,7 @@ async def vote_callback(event):
     except Exception:
         pass
 
+    # Голосование завершается, когда проголосовали все трое
     if len(vote_data["votes"]) >= len(vote_data["allowed_voters"]):
         await finish_vote(chat_id, target_id, reason="all_voted")
 
@@ -299,17 +288,15 @@ async def pending_command(event):
 
     for target_id, data in items:
         if chat_id not in active_votes or target_id not in active_votes[chat_id]:
-            allowed = set()
+            allowed = set(HOLY_TRINITY_USERNAMES)
+            initiator_username = None
             try:
-                participants = await client.get_participants(chat_id)
-                for p in participants:
-                    if is_holy_trinity(p):
-                        allowed.add(p.id)
-            except:
+                # Пытаемся восстановить юзернейм инициатора (если он был святым)
+                initiator_entity = await client.get_entity(data["initiator"])
+                if initiator_entity.username:
+                    initiator_username = initiator_entity.username.lower()
+            except Exception:
                 pass
-            
-            if data["initiator"] not in allowed:
-                allowed.add(data["initiator"])
 
             vote_msg = await event.reply(
                 build_vote_text(target_id, {"votes": {}, "allowed_voters": allowed}),
@@ -318,6 +305,7 @@ async def pending_command(event):
             )
             active_votes[chat_id][target_id] = {
                 "initiator": data["initiator"],
+                "initiator_username": initiator_username,
                 "votes": {},
                 "message_id": vote_msg.id,
                 "started_by_admin": True,
@@ -343,4 +331,4 @@ async def main():
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    asyncio.run(main())   # ← ключевая строка: корутина main запускается через asyncio.run
+    asyncio.run(main())
