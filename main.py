@@ -70,7 +70,6 @@ async def main():
     import cubic
     import ship
     import curse
-    import wea
 
     moderation.register(
         client=client,
@@ -87,9 +86,8 @@ async def main():
     cubic.register(client=client)
     ship.register(client=client)
     curse.register(client=client)
-    wea.register(client=client)
 
-    logging.info("✅ Модули moderation, cubic, ship, curse, wea подключены.")
+    logging.info("✅ Модули moderation, cubic, ship, curse подключены.")
 
     await client.run_until_disconnected()
 
