@@ -14,7 +14,6 @@ from telethon.tl.types import ChatBannedRights
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-SESSION_STR = os.environ.get("SESSION_STR", "")
 
 HOLY_TRINITY = {1319217425, 5376112672, 855714453}
 MAX_REQUESTS_PER_DAY = 2
@@ -27,7 +26,6 @@ logging.basicConfig(
 )
 
 # === ФИКТИВНЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ===
-# Render (Web Service) требует, чтобы приложение открыло порт.
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -48,8 +46,8 @@ muted_users = {}
 pending_admin_votes = {}
 
 # === КЛИЕНТ ===
-# Используем StringSession, чтобы не хранить файлы на сервере
-client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+# StringSession() с пустыми скобками означает "работаем в памяти, файлы не создаем"
+client = TelegramClient(StringSession(), API_ID, API_HASH)
 
 # === ВСПОМОГАТЕЛЬНЫЕ ===
 def check_daily_limit(user_id: int) -> bool:
@@ -184,7 +182,7 @@ async def block_command(event):
     
     target_username = args[1].lstrip("@")
 
-    # === MTProto: Поиск пользователя, даже если он не писал боту ===
+    # === MTProto: Поиск пользователя ===
     try:
         target = await client.get_entity(f"@{target_username}")
         target_id = target.id
@@ -318,15 +316,15 @@ async def pending_command(event):
 
 # === ЗАПУСК ===
 async def main():
-    if not API_ID or not API_HASH or not BOT_TOKEN or not SESSION_STR:
-        logging.error("❌ ОШИБКА: Не заданы переменные окружения (API_ID, API_HASH, BOT_TOKEN или SESSION_STR)!")
+    if not API_ID or not API_HASH or not BOT_TOKEN:
+        logging.error("❌ ОШИБКА: Не заданы переменные окружения (API_ID, API_HASH или BOT_TOKEN)!")
         return
 
     # Запускаем сервер для Render в фоне
     threading.Thread(target=run_health_server, daemon=True).start()
     logging.info("Фоновый веб-сервер для Render успешно запущен.")
 
-    # Запускаем MTProto клиент
+    # Запускаем MTProto клиент (он сам авторизуется по токену)
     await client.start(bot_token=BOT_TOKEN)
     logging.info("Бот запущен через MTProto (Telethon)! Готов к работе.")
     
