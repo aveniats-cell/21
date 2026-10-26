@@ -3,13 +3,14 @@
 Чтобы выковырить:
   1. Удали `import halloween` и `halloween.register(app, state)` из main.py
   2. Удали блок "HALLOWEEN 2026" в конце db.py (опционально)
-  3. Удали строку с тыквами в profile.py (опционально)
+  3. Удали строки с тыквами в profile.py (опционально)
   Всё. Старый бот работает как раньше.
 """
 
 import asyncio
 import logging
 import random
+import re
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -93,6 +94,9 @@ AWARD_BONUS_PUMPKINS = 100.0
 PUMPKIN_PER_MSG = 0.5
 PUMPKIN_DAILY_BONUS = 1.0
 
+# Регулярка для команды: и кириллица, и латиница
+HALLOWEEN_CMD_RE = re.compile(r"^/?(хэллоуин|halloween)$", re.IGNORECASE)
+
 
 # ==================== ВНУТРЕННИЕ ХЕЛПЕРЫ ====================
 
@@ -170,12 +174,11 @@ def register(app, state: dict) -> None:
             [InlineKeyboardButton("🔄 Обмен мусора", callback_data="hw|exchange_menu")],
         ])
 
-    async def halloween_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user = update.effective_user
-        bal = db.hw_get_pumpkins(user.id)
-        inv = db.hw_get_inventory(user.id)
+    async def _build_main_text(user_id: int) -> str:
+        bal = db.hw_get_pumpkins(user_id)
+        inv = db.hw_get_inventory(user_id)
         comps = {k: inv.get(k, 0) for k in COMPONENTS}
-        has_award = db.hw_has_award(user.id, AWARD_ID)
+        has_award = db.hw_has_award(user_id, AWARD_ID)
 
         text = (
             f"🎃 <b>Halloween 2026 «Bloody Moon»</b>\n"
@@ -191,13 +194,20 @@ def register(app, state: dict) -> None:
             text += f"🏆 <b>{AWARD_NAME}</b> — получена!\n"
         else:
             text += "🎯 Собери все 4 компонента и нажми «Слияние»."
+        return text
 
+    async def halloween_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user:
+            return
+        text = await _build_main_text(user.id)
         await update.effective_message.reply_text(
             text, reply_markup=main_keyboard(), parse_mode=ParseMode.HTML,
         )
 
-    from telegram.ext import CommandHandler
-    app.add_handler(CommandHandler(["хэллоуин", "halloween"], halloween_cmd))
+    app.add_handler(
+        MessageHandler(filters.Regex(HALLOWEEN_CMD_RE), halloween_cmd)
+    )
 
     # ---------------- Callback-роутер ----------------
 
@@ -231,29 +241,14 @@ def register(app, state: dict) -> None:
 
     # ---------------- Экраны ----------------
 
-    async def _show_main(q, user_id):
-        bal = db.hw_get_pumpkins(user_id)
-        inv = db.hw_get_inventory(user_id)
-        comps = {k: inv.get(k, 0) for k in COMPONENTS}
-        has_award = db.hw_has_award(user_id, AWARD_ID)
-        text = (
-            f"🎃 <b>Halloween 2026 «Bloody Moon»</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎃 Тыквы: <b>{bal:.2f}</b>\n\n"
-            f"📦 <b>Компоненты:</b>\n"
-            f"  📜 Бумага: {comps['paper']}\n"
-            f"  🖋 Чернила: {comps['ink']}\n"
-            f"  🔴 Печать: {comps['seal']}\n"
-            f"  💎 Камень: {comps['stone']}\n\n"
+    async def _show_main(q, user_id: int) -> None:
+        text = await _build_main_text(user_id)
+        await q.edit_message_text(
+            text, reply_markup=main_keyboard(), parse_mode=ParseMode.HTML,
         )
-        if has_award:
-            text += f"🏆 <b>{AWARD_NAME}</b> — получена!\n"
-        else:
-            text += "🎯 Собери все 4 компонента и нажми «Слияние»."
-        await q.edit_message_text(text, reply_markup=main_keyboard(), parse_mode=ParseMode.HTML)
         await q.answer()
 
-    async def _show_shop(q):
+    async def _show_shop(q) -> None:
         bal = db.hw_get_pumpkins(q.from_user.id)
         kb = [
             [InlineKeyboardButton(f"🪵 Wooden — {CHESTS['wooden']['price']:.0f} 🎃",
@@ -279,7 +274,7 @@ def register(app, state: dict) -> None:
         )
         await q.answer()
 
-    async def _show_inventory(q, user_id):
+    async def _show_inventory(q, user_id: int) -> None:
         inv = db.hw_get_inventory(user_id)
         lines = ["🎒 <b>Инвентарь</b>\n"]
         for k, meta in COMPONENTS.items():
@@ -308,7 +303,7 @@ def register(app, state: dict) -> None:
         )
         await q.answer()
 
-    async def _show_exchange_menu(q):
+    async def _show_exchange_menu(q) -> None:
         kb = [
             [InlineKeyboardButton("⚡ 20 мусора → Energy Bar",
                                   callback_data="hw|exch|energy_bar")],
@@ -328,7 +323,7 @@ def register(app, state: dict) -> None:
 
     # ---------------- Покупка ----------------
 
-    async def _buy_item(q, user_id, item):
+    async def _buy_item(q, user_id: int, item: str) -> None:
         if item in CHESTS:
             price = CHESTS[item]["price"]
             if not db.hw_spend_pumpkins(user_id, price):
@@ -372,7 +367,7 @@ def register(app, state: dict) -> None:
 
     # ---------------- Добыча ----------------
 
-    async def _start_mining(q, context, user_id):
+    async def _start_mining(q, context, user_id: int) -> None:
         inv = db.hw_get_inventory(user_id)
         if inv.get("energy_bar", 0) < 1:
             await q.answer("❌ Нет Energy Bar. Купи в магазине (2 🎃).", show_alert=True)
@@ -447,7 +442,7 @@ def register(app, state: dict) -> None:
 
     # ---------------- Мусор ----------------
 
-    async def _sell_all_junk(q, user_id):
+    async def _sell_all_junk(q, user_id: int) -> None:
         inv = db.hw_get_inventory(user_id)
         total = 0.0
         count = 0
@@ -470,7 +465,7 @@ def register(app, state: dict) -> None:
         )
         await q.answer()
 
-    async def _exchange_junk(q, user_id, kind):
+    async def _exchange_junk(q, user_id: int, kind: str) -> None:
         spec = JUNK_EXCHANGE.get(kind)
         if not spec:
             await q.answer("Неизвестный обмен.", show_alert=True)
@@ -538,7 +533,7 @@ def register(app, state: dict) -> None:
 
     # ---------------- Слияние ----------------
 
-    async def _try_fusion(q, user_id):
+    async def _try_fusion(q, user_id: int) -> None:
         if db.hw_has_award(user_id, AWARD_ID):
             await q.answer("🏆 У тебя уже есть эта награда!", show_alert=True)
             return
