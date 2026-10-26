@@ -5,24 +5,27 @@ from collections import defaultdict
 from datetime import date
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from telegram import Update
+from telegram.error import Conflict
 from telegram.ext import Application, ApplicationBuilder, CommandHandler
 
 import cubic
 import curse
+import halloween
 import moderation
 import profile
 import ship
 from resolver import Resolver
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-API_ID = int(os.environ.get("API_ID", 0))
+API_ID = int(os.environ.get("API_ID", 0) or 0)
 API_HASH = os.environ.get("API_HASH", "")
 STRING_SESSION = os.environ.get("STRING_SESSION", "")
 
 HOLY_TRINITY_USERNAMES = {"youwarm", "ilyshadep", "naranjortiz"}
 MAX_REQUESTS_PER_DAY = 2
 VOTE_TIMEOUT = 300
-MUTE_DURATION = 60 * 60 * 24  # 24 часа
+MUTE_DURATION = 60 * 60 * 24
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -41,29 +44,38 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         pass
 
 
-def _run_health_server() -> None:
+def _run_health_server():
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), HealthCheckHandler).serve_forever()
 
 
 async def _on_startup(app: Application) -> None:
-    resolver: Resolver = app.bot_data["resolver"]
-    await resolver.start()
+    resolver = app.bot_data.get("resolver")
+    if resolver:
+        await resolver.start()
     me = await app.bot.get_me()
     logger.info("Bot API: @%s (id=%s)", me.username, me.id)
 
 
 async def _on_shutdown(app: Application) -> None:
-    resolver: Resolver | None = app.bot_data.get("resolver")
+    resolver = app.bot_data.get("resolver")
     if resolver:
         await resolver.stop()
 
 
-async def _start_cmd(update, context):
+async def _on_error(update, context):
+    if isinstance(context.error, Conflict):
+        logger.warning("Conflict: другой инстанс ещё жив, PTB сам восстановится.")
+        return
+    logger.exception("Ошибка:", exc_info=context.error)
+
+
+async def _start_cmd(update: Update, context):
     await update.message.reply_text(
         "👋 Привет! Я бот этого чата.\n\n"
         "📋 <b>Команды:</b>\n"
         "/профиль [@user] — профиль участника\n"
+        "/хэллоуин — ивент «Bloody Moon»\n"
         "/суд @user — голосование за бан\n"
         "/ожидание — отложенные голосования\n"
         "/удача &lt;варианты&gt; — рулетка\n"
@@ -78,21 +90,21 @@ async def _start_cmd(update, context):
     )
 
 
-def main() -> None:
+def main():
     if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN не задан в переменных окружения!")
+        logger.error("❌ BOT_TOKEN не задан!")
         return
 
     if not (API_ID and API_HASH and STRING_SESSION):
         logger.warning(
             "⚠️ API_ID/API_HASH/STRING_SESSION не заданы. "
-            "Поиск по @username будет работать только для тех, кого бот уже видел."
+            "Поиск по @username будет работать только для тех, кого бот видел."
         )
 
     threading.Thread(target=_run_health_server, daemon=True).start()
     logger.info("Health-сервер запущен (порт %s).", os.environ.get("PORT", 10000))
 
-    app: Application = (
+    app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(_on_startup)
@@ -100,7 +112,6 @@ def main() -> None:
         .build()
     )
 
-    # MTProto-резолвер (Telethon с user-сессией)
     resolver = Resolver(api_id=API_ID, api_hash=API_HASH, session_string=STRING_SESSION)
     app.bot_data["resolver"] = resolver
 
@@ -117,12 +128,14 @@ def main() -> None:
     }
 
     app.add_handler(CommandHandler(["start", "help"], _start_cmd))
+    app.add_error_handler(_on_error)
 
     moderation.register(app, state)
     cubic.register(app)
     curse.register(app)
     ship.register(app, resolver)
     profile.register(app, HOLY_TRINITY_USERNAMES, resolver)
+    halloween.register(app, state)
 
     logger.info("Все модули подключены. Запуск polling…")
     app.run_polling(allowed_updates=["message", "callback_query"])
