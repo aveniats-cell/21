@@ -1,5 +1,4 @@
 python-telegram-bot==21.6
-libsql-experimental
-python-dotenv==1.0.1
+libsql-experimental==0.0.9
 aiohttp==3.10.5
 Telethon==1.36.0
