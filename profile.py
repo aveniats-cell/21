@@ -1,114 +1,98 @@
-import logging
-import re
-from html import escape as esc
-
-from telegram import ChatMemberAdministrator, ChatMemberOwner, Update
-from telegram.constants import ParseMode
-from telegram.ext import ContextTypes, MessageHandler, filters
+"""Профиль пользователя."""
+from datetime import datetime, timezone
+from telegram import Update
+from telegram.ext import ContextTypes, MessageHandler
 
 import db
+import config
+from helpers import (
+    is_admin_user, is_council_member, get_roles, RX, ensure_user,
+)
 
-logger = logging.getLogger(__name__)
 
-PROFILE_RE = re.compile(r"^/?профиль(?:\s+@?(\w+))?$", re.IGNORECASE)
+def _marriage_level(days: int) -> int:
+    return 1 + days // 7
 
 
-def register(app, holy_trinity, resolver) -> None:
-    async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        msg = update.effective_message
-        user = update.effective_user
-        if not msg or not msg.text or msg.text.startswith("/"):
-            return
-        if not user or user.is_bot:
-            return
-        try:
-            db.ensure_profile(user.id, user.username, user.first_name)
-            db.inc_message_count(user.id)
-        except Exception as e:
-            logger.error("Profile track error: %s", e)
+def _fmt_marriage(mar, target_id, divorced) -> str:
+    if not mar:
+        if divorced > 0:
+            return f"💔 разведён(а) ({divorced} раз)"
+        return "—"
+    u1, u2, forced, started_at = mar
+    other = u2 if u1 == target_id else u1
+    days = 0
+    try:
+        d = datetime.fromisoformat(started_at)
+        days = max(0, (datetime.now(timezone.utc) - d).days)
+    except Exception:
+        pass
+    level = _marriage_level(days)
+    tag = " 💠принуд." if forced else ""
+    return f"💍 id <code>{other}</code> · {days} дн. · ур.{level}{tag}"
 
-    async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        msg = update.effective_message
-        sender = update.effective_user
-        chat = update.effective_chat
 
-        m = PROFILE_RE.match(msg.text or "")
-        if not m:
-            return
-        target_name = m.group(1)
+async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    target = msg.from_user
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target = msg.reply_to_message.from_user
 
-        if target_name:
-            target = None
-            if resolver and resolver.enabled:
-                target = await resolver.resolve(target_name)
-            if target is None:
-                try:
-                    target = await context.bot.get_chat(f"@{target_name}")
-                except Exception:
-                    target = None
-            if target is None:
-                await msg.reply_text("❌ Пользователь не найден.")
-                return
-        elif msg.reply_to_message and msg.reply_to_message.from_user:
-            target = msg.reply_to_message.from_user
-        else:
-            target = sender
+    await ensure_user(target)
+    chat_id = msg.chat_id
 
-        try:
-            db.ensure_profile(
-                target.id,
-                getattr(target, "username", None),
-                getattr(target, "first_name", None),
-            )
-            data = db.get_profile(target.id)
-        except Exception as e:
-            await msg.reply_text(
-                f"❌ Ошибка базы: {esc(str(e))}", parse_mode=ParseMode.HTML,
-            )
-            return
-
-        role = "Участник"
-        try:
-            member = await context.bot.get_chat_member(chat.id, target.id)
-            if isinstance(member, ChatMemberOwner):
-                role = "Создатель"
-            elif isinstance(member, ChatMemberAdministrator):
-                role = "Админ"
-        except Exception:
-            pass
-
-        username = getattr(target, "username", None)
-        is_sss = "Да" if username and username.lower() in holy_trinity else "Нет"
-
-        first_seen = data["first_seen"] if data else "—"
-        msg_count = data["message_count"] if data else 0
-        criminal = "Да" if data and data["is_criminal"] else "Нет"
-        awards = data["awards"] if data and data["awards"] else "—"
-
-        first = getattr(target, "first_name", None) or ""
-        last = getattr(target, "last_name", None) or ""
-        name = f"{first} {last}".strip() or username or str(target.id)
-
-        pumpkins = db.hw_get_pumpkins(target.id)
-        has_award = db.hw_has_award(target.id, "bloody_moon_2026")
-
-        await msg.reply_text(
-            f"👤 <b>Имя:</b> {esc(name)}\n"
-            f"📅 <b>Первое появление:</b> {esc(str(first_seen))}\n"
-            f"💼 <b>Должность:</b> {esc(role)}\n"
-            f"🕵️ <b>Член совета ССС:</b> {is_sss}\n"
-            f"🏆 <b>Награды:</b> {esc(str(awards))}\n"
-            f"💬 <b>Кол-во сообщений:</b> {msg_count}\n"
-            f"🎃 <b>Тыквы:</b> {pumpkins:.2f}\n"
-            f"🩸 <b>Bloody Moon:</b> {'✅' if has_award else '—'}\n"
-            f"⚖️ <b>Судимость:</b> {criminal}",
-            parse_mode=ParseMode.HTML,
-        )
-
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, track_activity),
-        group=1,
+    row = await db.fetchone(
+        "SELECT coins, credit, mutes_issued, reports, courts, "
+        "ttt_wins, ttt_losses, ttt_played, divorced_count "
+        "FROM users WHERE user_id=?",
+        (target.id,),
     )
-    app.add_handler(MessageHandler(filters.Regex(PROFILE_RE), profile_cmd))
+    coins, credit, mutes, reports, courts, wins, loses, played, divorced = (
+        row if row else (100, 0, 0, 0, 0, 0, 0, 0, 0)
+    )
 
-    logger.info("Profile module: 'профиль' и трекер активности зарегистрированы.")
+    cnt = await db.fetchone(
+        "SELECT msg_total FROM chat_users WHERE chat_id=? AND user_id=?",
+        (chat_id, target.id),
+    )
+    msg_total = cnt[0] if cnt else 0
+
+    mar = await db.fetchone(
+        "SELECT user1_id, user2_id, forced, started_at FROM marriages "
+        "WHERE chat_id=? AND active=1 AND (user1_id=? OR user2_id=?)",
+        (chat_id, target.id, target.id),
+    )
+    marriage_text = _fmt_marriage(mar, target.id, divorced)
+
+    if is_admin_user(target):
+        role = "👑 Создатель"
+        council = "👑 главный"
+    else:
+        roles = await get_roles(chat_id, target.id)
+        if "commissar" in roles:
+            role = "🎖 Комиссар"
+        elif "sheriff" in roles:
+            role = "⭐ Шериф"
+        else:
+            role = "👤 Участник"
+        council = "✅ да" if await is_council_member(chat_id, target) else "—"
+
+    name = "@" + target.username if target.username else target.first_name
+    text = (
+        f"👤 <b>Профиль:</b> {name}\n"
+        f"💬 Сообщений: <b>{msg_total}</b>\n"
+        f"💰 Монеты: <b>{coins}</b>\n"
+        f"💳 Кредит: <b>{credit}/{config.CREDIT_MAX}</b>\n"
+        f"{marriage_text}\n"
+        f"🏛 Совет ССС: {council}\n"
+        f"🎖 Роль: {role}\n"
+        f"🎮 Крестики-нолики: ✅ {wins} · ❌ {loses} · 🎯 {played}\n"
+        f"🔇 Выдано мутов: {mutes}\n"
+        f"🚨 Жалоб подано: {reports}\n"
+        f"⚖️ Инициировано судов: {courts}"
+    )
+    await msg.reply_text(text, parse_mode="HTML")
+
+
+def register(app):
+    app.add_handler(MessageHandler(RX(r"^профиль$"), profile_cmd))
