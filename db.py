@@ -1,520 +1,185 @@
-import datetime
+"""Слой БД (Turso). Один поток + asyncio.Lock. Миграции и триггеры браков."""
+import asyncio
 import logging
-import os
-import time
+from concurrent.futures import ThreadPoolExecutor
 
 import libsql_experimental as libsql
+import config
 
-TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "")
-TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
+log = logging.getLogger(__name__)
 
 _conn = None
-_last_healthcheck = 0.0
-HEALTHCHECK_INTERVAL = 60  # сек: не чаще, чем раз в минуту
+_lock = asyncio.Lock()
+_executor = ThreadPoolExecutor(max_workers=1)
 
-logger = logging.getLogger(__name__)
+SCHEMA = [
+    f"""CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        coins INTEGER DEFAULT {config.COINS_START},
+        credit INTEGER DEFAULT 0,
+        mutes_issued INTEGER DEFAULT 0,
+        reports INTEGER DEFAULT 0,
+        courts INTEGER DEFAULT 0,
+        ttt_wins INTEGER DEFAULT 0,
+        ttt_losses INTEGER DEFAULT 0,
+        ttt_played INTEGER DEFAULT 0,
+        divorced_count INTEGER DEFAULT 0
+    )""",
+    """CREATE TABLE IF NOT EXISTS chat_users (
+        chat_id INTEGER,
+        user_id INTEGER,
+        msg_day INTEGER DEFAULT 0,
+        msg_total INTEGER DEFAULT 0,
+        day_date TEXT,
+        PRIMARY KEY (chat_id, user_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS roles (
+        chat_id INTEGER,
+        user_id INTEGER,
+        role TEXT,
+        PRIMARY KEY (chat_id, user_id, role)
+    )""",
+    """CREATE TABLE IF NOT EXISTS council (
+        chat_id INTEGER,
+        user_id INTEGER,
+        PRIMARY KEY (chat_id, user_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS marriages (
+        chat_id INTEGER,
+        user1_id INTEGER,
+        user2_id INTEGER,
+        forced INTEGER DEFAULT 0,
+        started_at TEXT,
+        active INTEGER DEFAULT 1,
+        PRIMARY KEY (chat_id, user1_id, user2_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS pr_channels (
+        chat_id INTEGER,
+        channel TEXT,
+        PRIMARY KEY (chat_id, channel)
+    )""",
+]
+
+# Миграции: приводят данные к консистентному виду до создания триггеров.
+MIGRATIONS = [
+    # Если пользователь оказался в нескольких активных браках в одном чате —
+    # оставляем только самый новый, остальные деактивируем.
+    """UPDATE marriages SET active = 0
+       WHERE active = 1
+         AND EXISTS (
+           SELECT 1 FROM marriages m2
+           WHERE m2.chat_id = marriages.chat_id
+             AND m2.active = 1
+             AND m2.started_at > marriages.started_at
+             AND (m2.user1_id IN (marriages.user1_id, marriages.user2_id)
+                  OR m2.user2_id IN (marriages.user1_id, marriages.user2_id))
+         )""",
+]
+
+# Триггеры: страхуют от «двое одновременно вступили в брак» и от багов в коде.
+TRIGGERS = [
+    """CREATE TRIGGER IF NOT EXISTS trg_marriage_ins
+       BEFORE INSERT ON marriages
+       WHEN NEW.active = 1
+       BEGIN
+           SELECT RAISE(ABORT, 'user already in active marriage')
+           WHERE EXISTS (
+               SELECT 1 FROM marriages
+               WHERE chat_id = NEW.chat_id AND active = 1
+                 AND NOT (user1_id = NEW.user1_id AND user2_id = NEW.user2_id)
+                 AND (user1_id IN (NEW.user1_id, NEW.user2_id)
+                      OR user2_id IN (NEW.user1_id, NEW.user2_id))
+           );
+       END""",
+    """CREATE TRIGGER IF NOT EXISTS trg_marriage_upd
+       BEFORE UPDATE OF active ON marriages
+       WHEN NEW.active = 1 AND OLD.active = 0
+       BEGIN
+           SELECT RAISE(ABORT, 'user already in active marriage')
+           WHERE EXISTS (
+               SELECT 1 FROM marriages
+               WHERE chat_id = NEW.chat_id AND active = 1
+                 AND NOT (user1_id = NEW.user1_id AND user2_id = NEW.user2_id)
+                 AND (user1_id IN (NEW.user1_id, NEW.user2_id)
+                      OR user2_id IN (NEW.user1_id, NEW.user2_id))
+           );
+       END""",
+]
 
 
-# ==================== ПОДКЛЮЧЕНИЕ ====================
+# ---------- синхронные воркеры ----------
+def _init_sync():
+    global _conn
+    _conn = libsql.connect(config.TURSO_URL, auth_token=config.TURSO_API)
+    for stmt in SCHEMA:
+        _conn.execute(stmt)
+    for stmt in MIGRATIONS:
+        try:
+            _conn.execute(stmt)
+        except Exception as e:
+            log.warning("Migration failed: %s", e)
+    for stmt in TRIGGERS:
+        _conn.execute(stmt)
+    _conn.commit()
 
-def _is_connection_error(exc: Exception) -> bool:
-    """Проверяет, что ошибка — потеря stream / соединения с Turso."""
-    msg = str(exc).lower()
-    return (
-        "stream not found" in msg
-        or "status=404" in msg
-        or ("hrana" in msg and "404" in msg)
-        or "connection" in msg and "closed" in msg
-    )
+
+def _execute_sync(sql, params):
+    cur = _conn.execute(sql, params)
+    _conn.commit()
+    return cur
 
 
-def _reconnect():
-    """Принудительно пересоздаёт соединение с Turso."""
-    global _conn, _last_healthcheck
+def _fetchall_sync(sql, params):
+    return _conn.execute(sql, params).fetchall()
+
+
+def _execute_multi_sync(statements, expected):
     try:
-        if _conn is not None:
-            _conn.close()
+        for i, (sql, params) in enumerate(statements):
+            _conn.execute(sql, params)
+            rc = _conn.execute("SELECT changes()").fetchone()[0]
+            if expected is not None and i < len(expected) and expected[i] is not None:
+                if rc != expected[i]:
+                    raise RuntimeError(
+                        f"atomic check failed at stmt#{i}: got {rc}, expected {expected[i]}"
+                    )
+        _conn.commit()
     except Exception:
-        pass
-    _conn = None
-    _last_healthcheck = 0.0
-    logger.warning("DB: переподключение к Turso...")
-
-
-def get_db():
-    """Возвращает живое соединение. Проверяет stream и переподключается при необходимости."""
-    global _conn, _last_healthcheck
-
-    if _conn is None:
-        if not TURSO_URL or not TURSO_TOKEN:
-            raise ValueError("TURSO_DATABASE_URL или TURSO_AUTH_TOKEN не заданы")
-        _conn = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
-        _init_tables()
-        _last_healthcheck = time.time()
-        return _conn
-
-    # Периодическая проверка живости stream (не чаще раза в минуту)
-    now = time.time()
-    if now - _last_healthcheck >= HEALTHCHECK_INTERVAL:
         try:
-            _conn.execute("SELECT 1").fetchone()
-        except Exception as e:
-            if _is_connection_error(e):
-                logger.warning("DB: stream мёртв, переподключаюсь... (%s)", e)
-                _reconnect()
-                return get_db()
-            raise
-        _last_healthcheck = now
-
-    return _conn
+            _conn.rollback()
+        except Exception:
+            pass
+        raise
 
 
-def _init_tables():
-    conn = _conn
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS profiles (
-            user_id       INTEGER PRIMARY KEY,
-            username      TEXT,
-            first_name    TEXT,
-            first_seen    TEXT,
-            message_count INTEGER DEFAULT 0,
-            is_criminal   INTEGER DEFAULT 0,
-            awards        TEXT    DEFAULT ''
+# ---------- асинхронный API ----------
+async def init():
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_executor, _init_sync)
+
+
+async def execute(sql, params=()):
+    async with _lock:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_executor, _execute_sync, sql, params)
+
+
+async def fetchall(sql, params=()):
+    async with _lock:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_executor, _fetchall_sync, sql, params)
+
+
+async def fetchone(sql, params=()):
+    rows = await fetchall(sql, params)
+    return rows[0] if rows else None
+
+
+async def execute_multi(statements, expected_rowcounts=None):
+    async with _lock:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _executor, _execute_multi_sync, statements, expected_rowcounts
         )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS mutes (
-            user_id    INTEGER PRIMARY KEY,
-            chat_id    INTEGER NOT NULL,
-            until_date TEXT    NOT NULL
-        )
-    """)
-    conn.commit()
-    logging.info("DB: таблицы profiles и mutes готовы")
-    _init_halloween_tables()
-
-
-# ==================== ПРОФИЛИ ====================
-
-def ensure_profile(user_id, username, first_name):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            conn.execute("""
-                INSERT INTO profiles (user_id, username, first_name, first_seen)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    username   = COALESCE(?, username),
-                    first_name = COALESCE(?, first_name)
-            """, (
-                user_id, username, first_name,
-                datetime.date.today().isoformat(),
-                username, first_name,
-            ))
-            conn.commit()
-            return
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def inc_message_count(user_id):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            conn.execute(
-                "UPDATE profiles SET message_count = message_count + 1 WHERE user_id = ?",
-                (user_id,),
-            )
-            conn.commit()
-            return
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def mark_criminal(user_id):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            conn.execute("UPDATE profiles SET is_criminal = 1 WHERE user_id = ?", (user_id,))
-            conn.commit()
-            return
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def get_profile(user_id):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            row = conn.execute(
-                "SELECT user_id, username, first_name, first_seen, message_count, "
-                "is_criminal, awards FROM profiles WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
-            if not row:
-                return None
-            return {
-                "user_id": row[0], "username": row[1], "first_name": row[2],
-                "first_seen": row[3], "message_count": row[4],
-                "is_criminal": row[5], "awards": row[6],
-            }
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def set_awards(user_id, awards):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            conn.execute("UPDATE profiles SET awards = ? WHERE user_id = ?", (awards, user_id))
-            conn.commit()
-            return
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-# ==================== МУТЫ ====================
-
-def save_mute(user_id, chat_id, until_date):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            conn.execute("""
-                INSERT INTO mutes (user_id, chat_id, until_date)
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET chat_id = ?, until_date = ?
-            """, (user_id, chat_id, until_date.isoformat(), chat_id, until_date.isoformat()))
-            conn.commit()
-            return
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def remove_mute(user_id):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            conn.execute("DELETE FROM mutes WHERE user_id = ?", (user_id,))
-            conn.commit()
-            return
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def get_active_mutes():
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            now = datetime.datetime.now().isoformat()
-            rows = conn.execute(
-                "SELECT user_id, chat_id, until_date FROM mutes WHERE until_date > ?",
-                (now,),
-            ).fetchall()
-            return [
-                {"user_id": r[0], "chat_id": r[1],
-                 "until_date": datetime.datetime.fromisoformat(r[2])}
-                for r in rows
-            ]
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-# ==================== HALLOWEEN 2026 ====================
-
-def _init_halloween_tables():
-    conn = _conn
-    conn.execute("""CREATE TABLE IF NOT EXISTS pumpkins (
-        user_id INTEGER PRIMARY KEY, amount REAL DEFAULT 0)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS inventory (
-        user_id INTEGER, item_id TEXT, amount INTEGER DEFAULT 0,
-        PRIMARY KEY (user_id, item_id))""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS awards (
-        user_id INTEGER, award_id TEXT, earned_at TEXT,
-        PRIMARY KEY (user_id, award_id))""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS mining_stats (
-        user_id INTEGER PRIMARY KEY, total_mines INTEGER DEFAULT 0,
-        fails_streak INTEGER DEFAULT 0)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS daily_bonus (
-        user_id INTEGER PRIMARY KEY, last_day TEXT)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS luck_buff (
-        user_id INTEGER PRIMARY KEY, bonus REAL DEFAULT 0,
-        until_mine INTEGER DEFAULT 0)""")
-    conn.commit()
-    logging.info("DB: таблицы Halloween готовы")
-
-
-def hw_add_pumpkins(user_id, amount):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            conn.execute("""INSERT INTO pumpkins (user_id, amount) VALUES (?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET amount = amount + ?""",
-                (user_id, amount, amount))
-            conn.commit()
-            return
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def hw_get_pumpkins(user_id):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            row = conn.execute(
-                "SELECT amount FROM pumpkins WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            return row[0] if row else 0.0
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def hw_spend_pumpkins(user_id, amount):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            row = conn.execute(
-                "SELECT amount FROM pumpkins WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            if not row or row[0] < amount:
-                return False
-            conn.execute(
-                "UPDATE pumpkins SET amount = amount - ? WHERE user_id = ?",
-                (amount, user_id),
-            )
-            conn.commit()
-            return True
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def hw_add_inventory(user_id, item_id, amount=1):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            conn.execute("""INSERT INTO inventory (user_id, item_id, amount) VALUES (?, ?, ?)
-                ON CONFLICT(user_id, item_id) DO UPDATE SET amount = amount + ?""",
-                (user_id, item_id, amount, amount))
-            conn.commit()
-            return
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def hw_get_inventory(user_id):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            rows = conn.execute(
-                "SELECT item_id, amount FROM inventory WHERE user_id = ? AND amount > 0",
-                (user_id,),
-            ).fetchall()
-            return {r[0]: r[1] for r in rows}
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def hw_remove_inventory(user_id, item_id, amount=1):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            row = conn.execute(
-                "SELECT amount FROM inventory WHERE user_id = ? AND item_id = ?",
-                (user_id, item_id),
-            ).fetchone()
-            if not row or row[0] < amount:
-                return False
-            conn.execute(
-                "UPDATE inventory SET amount = amount - ? WHERE user_id = ? AND item_id = ?",
-                (amount, user_id, item_id),
-            )
-            conn.commit()
-            return True
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def hw_has_award(user_id, award_id):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            return conn.execute(
-                "SELECT 1 FROM awards WHERE user_id = ? AND award_id = ?",
-                (user_id, award_id),
-            ).fetchone() is not None
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def hw_give_award(user_id, award_id):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            if conn.execute(
-                "SELECT 1 FROM awards WHERE user_id = ? AND award_id = ?",
-                (user_id, award_id),
-            ).fetchone() is not None:
-                return False
-            conn.execute(
-                "INSERT INTO awards (user_id, award_id, earned_at) VALUES (?, ?, ?)",
-                (user_id, award_id, datetime.datetime.now().isoformat()),
-            )
-            conn.commit()
-            return True
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def hw_get_mining_stats(user_id):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            row = conn.execute(
-                "SELECT total_mines, fails_streak FROM mining_stats WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
-            if not row:
-                conn.execute("INSERT INTO mining_stats (user_id) VALUES (?)", (user_id,))
-                conn.commit()
-                return {"total_mines": 0, "fails_streak": 0}
-            return {"total_mines": row[0], "fails_streak": row[1]}
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def hw_update_mining_stats(user_id, success):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            if success:
-                conn.execute("""UPDATE mining_stats SET total_mines = total_mines + 1,
-                    fails_streak = 0 WHERE user_id = ?""", (user_id,))
-            else:
-                conn.execute("""UPDATE mining_stats SET total_mines = total_mines + 1,
-                    fails_streak = fails_streak + 1 WHERE user_id = ?""", (user_id,))
-            conn.commit()
-            return
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def hw_claim_daily_bonus(user_id):
-    for attempt in range(2):
-        try:
-            today = datetime.date.today().isoformat()
-            conn = get_db()
-            row = conn.execute(
-                "SELECT last_day FROM daily_bonus WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            if row and row[0] == today:
-                return False
-            conn.execute("""INSERT INTO daily_bonus (user_id, last_day) VALUES (?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET last_day = ?""",
-                (user_id, today, today))
-            conn.commit()
-            return True
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def hw_set_luck_buff(user_id, bonus):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            conn.execute("""INSERT INTO luck_buff (user_id, bonus, until_mine)
-                VALUES (?, ?, 1) ON CONFLICT(user_id) DO UPDATE SET bonus = ?, until_mine = 1""",
-                (user_id, bonus, bonus))
-            conn.commit()
-            return
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def hw_get_luck_buff(user_id):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            row = conn.execute(
-                "SELECT bonus, until_mine FROM luck_buff WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            if not row or row[1] <= 0:
-                return 0.0
-            return row[0]
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
-
-
-def hw_consume_luck_buff(user_id):
-    for attempt in range(2):
-        try:
-            conn = get_db()
-            conn.execute("UPDATE luck_buff SET until_mine = 0 WHERE user_id = ?", (user_id,))
-            conn.commit()
-            return
-        except Exception as e:
-            if _is_connection_error(e) and attempt == 0:
-                _reconnect()
-                continue
-            raise
