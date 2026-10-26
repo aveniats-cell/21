@@ -1,4 +1,5 @@
 """Все секреты — из ENV Render (Settings → Environment)."""
+import logging
 import os
 
 ADMIN_USERNAME = (os.environ.get("ADMIN_USERNAME") or "@YouWarm").lstrip("@").lower()
@@ -23,6 +24,19 @@ def validate():
     if not TURSO_URL:  missing.append("TURSO_URL")
     if not TURSO_API:  missing.append("TURSO_API")
     if missing:
-        raise SystemExit(
-            "❌ Не заданы ENV в Render → Environment:\n   " + "\n   ".join(missing)
+        logging.basicConfig(level=logging.ERROR)
+        logging.error(
+            "❌ Не заданы ENV в Render → Environment:\n   "
+            + "\n   ".join(missing)
+            + "\n   Задай переменные и сделай Manual Deploy."
         )
+        raise SystemExit(1)
+    # Диагностика: покажем, что реально доехало (без утечки секретов)
+    logging.info(
+        "ENV OK: BOT_TOKEN=%s TURSO_URL=%s TURSO_API=%s ADMIN_ID=%s ADMIN_USERNAME=%s",
+        f"***{BOT_TOKEN[-4:]}" if BOT_TOKEN else "none",
+        TURSO_URL,
+        "set" if TURSO_API else "missing",
+        ADMIN_ID,
+        ADMIN_USERNAME,
+    )
