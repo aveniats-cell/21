@@ -1,16 +1,15 @@
-"""Слой БД (Turso). Один поток + asyncio.Lock. Миграции и триггеры браков."""
+"""Слой БД (Turso) через libsql-client (HTTP). Триггеры браков + миграции."""
 import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor
 
-import libsql_experimental as libsql
+import libsql_client
 import config
 
 log = logging.getLogger(__name__)
 
-_conn = None
+_client = None
 _lock = asyncio.Lock()
-_executor = ThreadPoolExecutor(max_workers=1)
+
 
 SCHEMA = [
     f"""CREATE TABLE IF NOT EXISTS users (
@@ -62,10 +61,7 @@ SCHEMA = [
     )""",
 ]
 
-# Миграции: приводят данные к консистентному виду до создания триггеров.
 MIGRATIONS = [
-    # Если пользователь оказался в нескольких активных браках в одном чате —
-    # оставляем только самый новый, остальные деактивируем.
     """UPDATE marriages SET active = 0
        WHERE active = 1
          AND EXISTS (
@@ -78,7 +74,6 @@ MIGRATIONS = [
          )""",
 ]
 
-# Триггеры: страхуют от «двое одновременно вступили в брак» и от багов в коде.
 TRIGGERS = [
     """CREATE TRIGGER IF NOT EXISTS trg_marriage_ins
        BEFORE INSERT ON marriages
@@ -109,67 +104,43 @@ TRIGGERS = [
 ]
 
 
-# ---------- синхронные воркеры ----------
-def _init_sync():
-    global _conn
-    _conn = libsql.connect(config.TURSO_URL, auth_token=config.TURSO_API)
+async def init():
+    global _client
+    _client = libsql_client.create_client(
+        url=config.TURSO_URL,
+        auth_token=config.TURSO_API,
+    )
     for stmt in SCHEMA:
-        _conn.execute(stmt)
+        await _client.execute(stmt)
     for stmt in MIGRATIONS:
         try:
-            _conn.execute(stmt)
+            await _client.execute(stmt)
         except Exception as e:
             log.warning("Migration failed: %s", e)
     for stmt in TRIGGERS:
-        _conn.execute(stmt)
-    _conn.commit()
+        await _client.execute(stmt)
 
 
-def _execute_sync(sql, params):
-    cur = _conn.execute(sql, params)
-    _conn.commit()
-    return cur
-
-
-def _fetchall_sync(sql, params):
-    return _conn.execute(sql, params).fetchall()
-
-
-def _execute_multi_sync(statements, expected):
+def _changes_of(rs) -> int:
     try:
-        for i, (sql, params) in enumerate(statements):
-            _conn.execute(sql, params)
-            rc = _conn.execute("SELECT changes()").fetchone()[0]
-            if expected is not None and i < len(expected) and expected[i] is not None:
-                if rc != expected[i]:
-                    raise RuntimeError(
-                        f"atomic check failed at stmt#{i}: got {rc}, expected {expected[i]}"
-                    )
-        _conn.commit()
+        rows = getattr(rs, "rows", None)
+        if rows:
+            v = rows[0][0]
+            return int(v) if v is not None else 0
     except Exception:
-        try:
-            _conn.rollback()
-        except Exception:
-            pass
-        raise
-
-
-# ---------- асинхронный API ----------
-async def init():
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(_executor, _init_sync)
+        pass
+    return 0
 
 
 async def execute(sql, params=()):
     async with _lock:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(_executor, _execute_sync, sql, params)
+        return await _client.execute(sql, list(params))
 
 
 async def fetchall(sql, params=()):
     async with _lock:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(_executor, _fetchall_sync, sql, params)
+        rs = await _client.execute(sql, list(params))
+        return [tuple(r) for r in (rs.rows or [])]
 
 
 async def fetchone(sql, params=()):
@@ -178,8 +149,20 @@ async def fetchone(sql, params=()):
 
 
 async def execute_multi(statements, expected_rowcounts=None):
+    """Атомарная пачка через batch(). После каждого statement — SELECT changes()."""
     async with _lock:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            _executor, _execute_multi_sync, statements, expected_rowcounts
-        )
+        items = []
+        for sql, params in statements:
+            items.append((sql, list(params)))
+            items.append(("SELECT changes() AS c", []))
+        results = await _client.batch(items)
+        if expected_rowcounts is not None:
+            for i, exp in enumerate(expected_rowcounts):
+                if exp is None:
+                    continue
+                chk = _changes_of(results[i * 2 + 1])
+                if chk != exp:
+                    raise RuntimeError(
+                        f"atomic check failed at stmt#{i}: got {chk}, expected {exp}"
+                    )
+        return results
