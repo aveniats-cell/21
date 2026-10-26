@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 PROFILE_RE = re.compile(r"^/?профиль(?:\s+@?(\w+))?$", re.IGNORECASE)
 
 
-def register(app, holy_trinity: set[str], resolver) -> None:
+def register(app, holy_trinity, resolver) -> None:
     async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
         user = update.effective_user
@@ -37,7 +37,6 @@ def register(app, holy_trinity: set[str], resolver) -> None:
             return
         target_name = m.group(1)
 
-        # Резолвим: аргумент → реплай → сам отправитель
         if target_name:
             target = None
             if resolver and resolver.enabled:
@@ -63,30 +62,20 @@ def register(app, holy_trinity: set[str], resolver) -> None:
             )
             data = db.get_profile(target.id)
         except Exception as e:
-            await msg.reply_text(f"❌ Ошибка базы: {esc(str(e))}", parse_mode=ParseMode.HTML)
+            await msg.reply_text(
+                f"❌ Ошибка базы: {esc(str(e))}", parse_mode=ParseMode.HTML,
+            )
             return
 
-        # Должность: PTB → резолвер как fallback
         role = "Участник"
-        got_role = False
         try:
             member = await context.bot.get_chat_member(chat.id, target.id)
             if isinstance(member, ChatMemberOwner):
                 role = "Создатель"
-                got_role = True
             elif isinstance(member, ChatMemberAdministrator):
                 role = "Админ"
-                got_role = True
         except Exception:
             pass
-
-        if not got_role and resolver and resolver.enabled:
-            perms = await resolver.get_permissions(chat.id, target.id)
-            if perms:
-                if getattr(perms, "is_creator", False):
-                    role = "Создатель"
-                elif getattr(perms, "is_admin", False):
-                    role = "Админ"
 
         username = getattr(target, "username", None)
         is_sss = "Да" if username and username.lower() in holy_trinity else "Нет"
@@ -100,6 +89,9 @@ def register(app, holy_trinity: set[str], resolver) -> None:
         last = getattr(target, "last_name", None) or ""
         name = f"{first} {last}".strip() or username or str(target.id)
 
+        pumpkins = db.hw_get_pumpkins(target.id)
+        has_award = db.hw_has_award(target.id, "bloody_moon_2026")
+
         await msg.reply_text(
             f"👤 <b>Имя:</b> {esc(name)}\n"
             f"📅 <b>Первое появление:</b> {esc(str(first_seen))}\n"
@@ -107,6 +99,8 @@ def register(app, holy_trinity: set[str], resolver) -> None:
             f"🕵️ <b>Член совета ССС:</b> {is_sss}\n"
             f"🏆 <b>Награды:</b> {esc(str(awards))}\n"
             f"💬 <b>Кол-во сообщений:</b> {msg_count}\n"
+            f"🎃 <b>Тыквы:</b> {pumpkins:.2f}\n"
+            f"🩸 <b>Bloody Moon:</b> {'✅' if has_award else '—'}\n"
             f"⚖️ <b>Судимость:</b> {criminal}",
             parse_mode=ParseMode.HTML,
         )
