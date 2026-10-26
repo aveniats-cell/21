@@ -164,6 +164,7 @@ async def post_init(application: Application):
     log.info("Инициализация БД...")
     try:
         await db.init()
+        log.info("БД готова.")
     except Exception as e:
         log.exception("Критическая ошибка БД: %s", e)
         raise
@@ -245,4 +246,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        # SystemExit — это наш validate(), текст уже в логе ERROR-строкой
+        raise
+    except Exception:
+        logging.getLogger("SuperBot").exception("Фатальная ошибка при запуске")
+        raise
